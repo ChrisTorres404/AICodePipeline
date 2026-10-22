@@ -62,7 +62,7 @@ CURRENT_USER_ID="${CURRENT_USER_ID:-}"
 # Scratch space for request bodies. Written to files rather than passed on the
 # command line: a password containing ! or $ is mangled by the shell long
 # before curl sees it, and the test then measures the mangling.
-TEST_TMP_DIR="${TEST_TMP_DIR:-${TMPDIR:-/tmp}/harness-suite.$$}"
+tmpbase="${TMPDIR:-/tmp}"; TEST_TMP_DIR="${TEST_TMP_DIR:-${tmpbase%/}/harness-suite.$$}"
 COOKIE_JAR="${COOKIE_JAR:-$TEST_TMP_DIR/cookies.txt}"
 
 # Created on first use, not at source time: sourcing a library should not

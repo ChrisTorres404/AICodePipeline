@@ -27,7 +27,8 @@ function parseTestDocument(filePath) {
   // Extract test IDs and status from markdown
   // Matches: | 1.1 | Category | Description | EXECUTED — PASS | or
   //          **Status:** EXECUTED — PASS
-  const testRegex = /(?:\|\s*(\d+\.\d+)\s*\|.*?\|\s*(EXECUTED — PASS|EXECUTED — FAIL|NOT EXECUTED[^|]*)\s*\||Test\s+(\d+\.\d+):.*?\n.*?\*\*Status:\*\*\s*(EXECUTED — PASS|EXECUTED — FAIL|NOT EXECUTED[^*]*))/gs;
+  // Em dash, en dash or hyphen, as every other status reader accepts.
+  const testRegex = /(?:\|\s*(\d+\.\d+)\s*\|.*?\|\s*(EXECUTED [—–-] PASS|EXECUTED [—–-] FAIL|NOT EXECUTED[^|]*)\s*\||Test\s+(\d+\.\d+):.*?\n.*?\*\*Status:\*\*\s*(EXECUTED [—–-] PASS|EXECUTED [—–-] FAIL|NOT EXECUTED[^*]*))/gs;
 
   const tests = [];
   let match;
@@ -41,8 +42,8 @@ function parseTestDocument(filePath) {
         id: testId,
         status: status,
         executed: status.startsWith('EXECUTED'),
-        passed: status === 'EXECUTED — PASS',
-        failed: status === 'EXECUTED — FAIL'
+        passed: /^EXECUTED [—–-] PASS$/.test(status),
+        failed: /^EXECUTED [—–-] FAIL$/.test(status)
       });
     }
   }

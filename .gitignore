@@ -18,3 +18,6 @@ playbooks/*/
 
 # reference material under extraction — never committed
 Examples_for_claude/
+
+# the owner's private folders, whatever they are called — never committed (a clone has no .git/info/exclude)
+/Private-*/

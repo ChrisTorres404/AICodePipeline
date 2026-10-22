@@ -1,5 +1,51 @@
 # Changelog
 
+### 1.5.0
+
+A layout release. A project can keep its code in app/ and the pipeline in acp/, new projects can
+start that way, and `acp migrate` moves an existing one: a plan that moves nothing, a checked
+backup, your answers, and one commit that makes the move. acp doctor and acp check name what sits
+outside the layout, hold every order folder to one structure, and warn when .gitignore lets secret
+files into git; each order gets an artifacts/ folder that never enters git, and the evaluation
+suite grew from 109 to 131. After upgrading, run `acp doctor`, then `wo verify` again on each open
+order. See `docs/releases/1.5.0.md`.
+
+### 1.4.2
+
+A hardening release: fifty-one fixes found by reviewing 1.4.1 line by line. Closing a work
+order holds more strictly to evidence that matches the code, the drivers refuse bad input
+instead of writing broken or half-made documents, and titles, paths and settings are treated
+as plain text everywhere; the evaluation suite grew from 58 to 109. After upgrading, run
+`wo verify` again on each open order. See `docs/releases/1.4.2.md`.
+
+### 1.4.1
+
+- `wo close` no longer damages the knowledge base. Its grow step marked a profile
+  orphaned whenever the file name was not one of the features the scaffold's own
+  grouping found, without checking a path, and rewrote it whether the scaffold or a
+  person had written it; a project whose profiles split a directory into packages
+  lost every one of them at every close. Now a profile is judged by the paths it
+  covers: its SOURCE citations (read from the root or from the profile's own
+  folder) and its Covers line (wildcards expanded, backslashes read as slashes, a
+  leading `./` dropped, words that are not paths skipped), or, when it names no
+  path, its feature key mapped to a directory. Grow adds profiles only for features
+  no profile covers, reports a profile whose covered paths are all gone, changes no
+  existing profile, and exits 3 when it reports one; `scaffold --grow --check`
+  reports the same and writes nothing. An explicit `acp kb scaffold` marks a
+  profile it wrote orphaned only when its covered paths are gone, and reports one a
+  person wrote. The pipeline's own document folders (the folder holding the
+  knowledge base, `WORKSPACE_DIR`, `DOCS_DIR`) are never a feature; a code folder
+  that holds the knowledge base still is. The close shows every line grow prints,
+  keeps its errors, and records the report, or the failure, in the closeout under
+  "Knowledge base changes at close". Under the strict profile it runs the
+  report-only check first and refuses, with nothing written, while a profile
+  covers paths that are gone; `ACP_SKIP_KB=1` overrides, with a reason in the
+  closeout (`kb-close-keeps-profiles`)
+- `acp doctor` and `bin/lint`, when PyYAML is not installed, accepted frontmatter
+  that YAML rejects: a `key: value` line indented under a plain value. They now
+  reject it, so `acp doctor` reports such a skill as not parsing on every machine;
+  none of the definitions the pipeline ships changes (`baseline-and-doctor`)
+
 ### 1.4.0
 
 - `packs/` is now `playbooks/` and `bin/pack` is `bin/playbook`; skill packs

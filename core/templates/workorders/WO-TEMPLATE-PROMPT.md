@@ -2,7 +2,7 @@ You are operating inside the {{WORKSPACE_DIR}} / {{PROJECT_NAME}} context.
 
 Work Order: WO-XXXX – [Title]
 Series: [XXXX – Series Name]
-Priority: [P0/P1/P2/P3]
+**Priority:** P0 | P1 | P2 | P3
 Owner: _(who is accountable for this work order)_
 Date: YYYY-MM-DD
 

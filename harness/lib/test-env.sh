@@ -71,7 +71,7 @@ health_url() {
 # ----------------------------------------------------------------------------
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"
-DB_USER="${DB_USER:-$USER}"
+DB_USER="${DB_USER:-${USER:-$(id -un 2>/dev/null || true)}}"
 DB_NAME="${DB_NAME:-}"
 export PGPASSWORD="${PGPASSWORD:-${DB_PASS:-}}"
 

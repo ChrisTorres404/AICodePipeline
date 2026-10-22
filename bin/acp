@@ -8,10 +8,17 @@
 #
 #   acp init <path> [--name N] [--domain D] [--playbook P]  new project from nothing
 #   acp install <path>                                   add to an existing project
+#   acp layout [--check] --pipeline-dir P --code-dir C   set pipeline.config.sh for the P/ (pipeline) + C/ (code) layout
 #   acp doctor [path]                                    is the install healthy?
+#   acp doctor --gitignore-hint [path]                   the .gitignore lines that keep secret files out of git
 #   acp baseline [--command '<cmd>'] [--dry-run]         run the project's own tests once and record the first measurement
 #   acp intake [status|inventory]                        the work orders a project completes before it is operational
 #   acp kb status|bind|impact                            the knowledge base: what describes the code, and whether it still does
+#   acp migrate plan [--project D] [--repo D] [--replace] plan the move into app/ and acp/: writes .acp-migration/, moves nothing
+#   acp migrate backup --to D [--project D] | --check [--project D] [--repo D]    the whole project as one checked tar outside it, before anything moves
+#   acp migrate answer <n> <option> | <n> --folder D [--project D]   record the owner's answer to one question of the plan
+#   acp migrate apply [--project D]                      the restructure, as one commit; run from an ACP source clone
+#   acp migrate rollback [--project D] [--archive F]     put a migrated project back as its backup holds it
 #   acp wo|bug|playbook|sanitize|detect-stack <args>     forward to the driver
 #   acp check [--staged|--since REF|--paths P...]        the rules over a set of files; blocks on secrets,
 #                                                        weakened config, closeouts without evidence
@@ -20,6 +27,8 @@
 #   acp commands | acp command <name>                    the slash commands as instructions any agent can read
 #   acp skills | acp skill <name>                        the skills, the same way
 #   acp ci github                                        add a workflow that runs the rules on every pull request
+#   acp publish-check [--identity E] [--deny RX]         before a first push: the whole history of every branch, read for
+#                                                        secrets, junk, identities, a second pipeline copy and old branches
 #   acp lint [--strict]                                  validate agents, skills, hooks, rules
 #   acp eval list|run [name]|new <name>                  the pipeline's own behavioural evaluations
 #   acp test [--live]                                    every check in one command (lint, sanitize, evals, plugin; --live adds real sessions)
@@ -30,7 +39,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 BIN="$ROOT/bin"
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 usage() { sed -n '3,/^# -\{20,\}$/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 
@@ -80,6 +89,51 @@ run_bounded() { # <seconds> <command...> -> the command's status, 124 on timeout
   ) 2>/dev/null
 }
 
+# Secret files never enter git. Each probe below is a name such a file has; the project's own .gitignore
+# files must ignore it, which git check-ignore says (the file is never read as text). The global excludes
+# file and .git/info/exclude do not count: a clone carries neither. The owner's file is never written;
+# the lines that would close a gap are printed. One rule per line: probe|the lines that ignore it.
+SECRET_RULES='.env|.env
+.env.production|.env.*,!.env.example,!.env.sample,!.env.template
+x.pem|*.pem
+x.key|*.key
+x.p12|*.p12
+x.pfx|*.pfx
+id_rsa|id_rsa*,!*.pub
+id_ed25519|id_ed25519*,!*.pub
+id_ecdsa|id_ecdsa*,!*.pub'
+gi_ignored() { # project path -> 0 when one of the project's own .gitignore files ignores path
+  local src
+  src="$(git -C "$1" -c core.excludesFile=/dev/null check-ignore -v --no-index -- "$2" 2>/dev/null)" || return 1
+  case "${src%%:*}" in /*|.git/*|*/.git/*) return 1;; esac   # info/exclude, or a file outside the project
+  # source:line:pattern<TAB>path; with -v a negation that matched is shown too, and it lets the file in
+  src="${src#*:}"; src="${src#*:}"; case "$src" in '!'*) return 1;; esac
+  return 0
+}
+gi_gaps() { # project -> "probe<TAB>lines" for each secret probe its .gitignore lets into git, at the root and in CODE_DIR
+  local t="$1" code="" rule probe where
+  if [ -f "$t/pipeline.config.sh" ]; then code="$(sed -n 's/^export CODE_DIR="\([^"]*\)".*/\1/p' "$t/pipeline.config.sh" | head -1)"; fi
+  case "$code" in ''|.|./|/*|*'$'*|*..*) code="";; esac   # only a plain folder inside the project is probed too
+  while IFS= read -r rule; do
+    probe="${rule%%|*}"
+    for where in "" ${code:+"${code%/}/"}; do
+      gi_ignored "$t" "$where$probe" || { printf '%s\t%s\n' "$where$probe" "${rule#*|}"; break; }
+    done
+  done <<EOF_RULES
+$SECRET_RULES
+EOF_RULES
+}
+gi_block() { # project -> the lines to add to its .gitignore, each once, where it last falls: a negation
+  # (!*.pub) after every line it answers, since the last line that matches decides
+  gi_gaps "$1" | cut -f2 | tr ',' '\n' | awk 'NF { line[++n] = $0; last[$0] = n } END { for (i = 1; i <= n; i++) if (last[line[i]] == i) print line[i] }'
+}
+gitignore_hint() {
+  local t="${1:-$PWD}"
+  t="$(cd "$t" 2>/dev/null && pwd)" || { echo "acp doctor --gitignore-hint: ${1:-.} is not a directory" >&2; return 2; }
+  git -C "$t" rev-parse --show-toplevel >/dev/null 2>&1 || { echo "acp doctor --gitignore-hint: $t is not a git repository" >&2; return 2; }
+  gi_block "$t"
+}
+
 doctor() {
   local target="${1:-$PWD}" fail=0 warn=0
   target="$(cd "$target" 2>/dev/null && pwd)" || { echo "acp doctor: $1 is not a directory" >&2; return 2; }
@@ -114,7 +168,14 @@ doctor() {
     ok "profile: $profile"
     local unres vre="PROJECT_NAME|PROJECT_SLUG|PROJECT_DOMAIN|GITHUB_REPO|PROJECT_ROOT|PIPELINE_ROOT|WORKSPACE_DIR|DOCS_DIR|WORKORDERS_DIR|BUGS_DIR|TESTING_DIR|SESSIONS_DIR|API_APP|ADMIN_APP|PORTAL_APP|DEV_APP|WEB_APP|SDK_PKG|DB_NAME|CLI_NAME|API_BASE_URL|WEB_ORIGIN|STACK_SECTION"
     unres="$(grep -rhoE "\{\{(${vre})\}\}" "$dest/core" "$dest/harness" --exclude-dir=project --exclude-dir=templates 2>/dev/null | sort -u | tr '\n' ' ' || true)"
-    if [ -d "$dest/playbooks" ]; then ok "playbooks/ present"; else bad "no playbooks/ directory (re-run install)"; fi
+    local pbd="$dest/playbooks" prc=0 tp; tp="$(cd "$target" && pwd -P)"   # the playbooks folder as the drivers find it, from the config alone
+    [ ! -f "$cfg" ] || pbd="$(env -u PLAYBOOKS_DIR -u PACKS_DIR -u CODE_DIR "$BIN/playbook" where --project "$target" 2>&1)" || prc=$?
+    case "$prc" in
+      0) local pbs="${pbd#"$tp"/}"; pbs="${pbs#"$target"/}"   # shown relative to the project
+         if [ -d "$pbd" ]; then ok "playbooks folder present ($pbs)"; else bad "no playbooks folder at $pbs (re-run install)"; fi;;
+      2) meh "PLAYBOOKS_DIR is not set as plain data in pipeline.config.sh; the playbooks folder is not checked";;
+      *) bad "$pbd";;
+    esac
     [ -d "$dest/packs" ] && meh "packs/ is the old name for playbooks/; re-run install to move it" || true
     [ -z "$unres" ] && ok "no unresolved template variables" || bad "unresolved variables: $unres"
   else
@@ -146,7 +207,9 @@ def yaml_ok(fm):
     for line in fm.split("\n"):
         if not line.strip(): continue
         if line.startswith((" ", "\t")):
-            if not prev_block and not re.match(r"^\s+- ", line) and not re.match(r"^\s+\S+: ", line): return False
+            # An indented line belongs to a key whose value was empty or a block marker. Under a plain value,
+            # `  key: value` is what YAML rejects ("mapping values are not allowed here").
+            if not prev_block and not re.match(r"^\s+- ", line): return False
             continue
         m = re.match(r"^([A-Za-z_][\w-]*):(\s*(.*))?$", line)
         if not m: return False
@@ -260,28 +323,65 @@ PYEOF
       case "$krc" in 0) ok "knowledge base: $kl";; 1) meh "knowledge base: $kl — profiles describe code that changed; update them, then  acp kb bind";; 2) bad "knowledge base: $kl — profiles cite files or lines that no longer exist";; 4) meh "knowledge base: $kl — profiles short of the configured level; the intake work order for it says what to write";; *) meh "knowledge base: $kl";; esac
     else meh "no knowledge base: nothing describes this repository yet — the intake work order for it says how"; fi
   fi
+  # The layout: work in the workspace, code in its folder, one pipeline, one knowledge base, and only the
+  # tool wiring at the root. Detection only: moving things is acp migrate's job.
+  if git -C "$target" rev-parse --show-toplevel >/dev/null 2>&1; then
+    local le="$ROOT/core/hooks/layout.py" lo lrc=0 ll
+    [ -f "$le" ] || [ ! -d "$ROOT/hooks/scripts" ] || le="$ROOT/hooks/scripts/layout.py"   # plugin layout
+    lo="$(python3 "$le" --root "$target" 2>&1)" || lrc=$?
+    case "$lrc" in
+      0|1) # nothing out of place is said only when nothing was, warnings included
+         case $'\n'"$lo" in *$'\n''warn '*) ;; *)
+           [ "$lrc" -ne 0 ] || ok "layout: nothing out of place$(printf '%s\n' "$lo" | sed -n 's/^note: \(.*\)/ (\1)/p')";; esac
+         while IFS= read -r ll; do case "$ll" in note:*|'') ;; "warn "*) meh "layout: ${ll#warn }";; *) bad "layout: $ll";; esac; done <<EOF_LAYOUT
+$lo
+EOF_LAYOUT
+         ;;
+      4) meh "layout: $(printf '%s\n' "$lo" | sed -n 's/^note: //p')";;
+      *) bad "layout: not checked: $lo";;
+    esac
+  else meh "layout: not a git repository; not checked"; fi
+  # Secret files: tested by name with git check-ignore; the owner's .gitignore is never written, the lines are printed.
+  if git -C "$target" rev-parse --show-toplevel >/dev/null 2>&1; then
+    local gaps; gaps="$(gi_gaps "$target")"
+    if [ -z "$gaps" ]; then ok "secret files: the project's .gitignore keeps .env files, keys and certificates out of git"
+    else
+      meh "secret files: the project's .gitignore lets $(printf '%s\n' "$gaps" | cut -f1 | tr '\n' ' ')into git; add these lines to $target/.gitignore (acp doctor --gitignore-hint prints them alone):"
+      gi_block "$target" | sed 's/^/          /'
+    fi
+  fi
   # Reporting "healthy" while the drivers cannot actually complete a lifecycle is
   # the worst failure a doctor can have: prove one end to end, here, now.
   if [ -x "$dest/bin/wo" ]; then
-    # The drivers resolve the project from the working directory, so the probe has
-    # to run inside the target. Doctoring one project must never write into another.
-    local tabs probe pn
-    tabs="$(cd "$target" && pwd)"
-    probe="$tabs/.acp-doctor-probe.$$"
-    printf '#!/usr/bin/env bash\nexit 0\n' > "$probe" && chmod +x "$probe"
-    pn="$(cd "$tabs" && "$dest/bin/wo" new "acp doctor probe" --size trivial --area docs 2>/dev/null | grep -o 'WO-[0-9]*' | head -1)"
-    if [ -n "$pn" ]; then
-      pn="${pn#WO-}"
-      # The probe's verification document is untouched template, so the placeholder
-      # gate would refuse the close. That gate is for human work, not for this.
-      if ( cd "$tabs" && "$dest/bin/wo" verify "$pn" --run "$probe" >/dev/null 2>&1 \
-             && ALLOW_PLACEHOLDERS=1 "$dest/bin/wo" close "$pn" >/dev/null 2>&1 ); then
-        ok "lifecycle probe: a work order opened, verified and closed in this layout"
-      else bad "lifecycle probe failed: the drivers cannot complete a work order here"; fi
-      local wod pd; wod="$(sed -n 's/^export WORKORDERS_DIR="\([^"]*\)".*/\1/p' "$cfg" 2>/dev/null)"; wod="${wod:-Workspace/Docs/WorkOrders}"
-      pd="$(find "$tabs/$wod" -maxdepth 1 -type d -name "WO-$pn-*" 2>/dev/null | head -1)"; [ -n "$pd" ] && rm -rf "$pd"
-    else bad "lifecycle probe: wo new failed in this layout"; fi
-    rm -f "$probe"
+    # The probe runs in a scratch folder whose configuration sources the project's own and then pins PROJECT_ROOT
+    # to that folder (a configuration that sources a sibling file still works), with a file in its code folder; never
+    # in the project: closing a work order grows the knowledge base and writes the order's folder, and a doctor
+    # writes nothing the project owns. If the scratch folder cannot be made, the probe is not run, and says so.
+    local probe pn tmp code cfa
+    tmpbase="${TMPDIR:-/tmp}"; if ! tmp="$(mktemp -d "${tmpbase%/}/acp-doctor.XXXXXX")"; then bad "lifecycle probe: not run: no scratch folder could be made"
+    elif ! { cfa="$(cd "$(dirname "$cfg")" && pwd -P)/pipeline.config.sh" && printf '. %q\nexport PROJECT_ROOT=%q\n' "$cfa" "$tmp" > "$tmp/pipeline.config.sh"; }; then
+      bad "lifecycle probe: not run: the configuration could not be written to $tmp"; rm -rf "$tmp"
+    else
+      # CODE_DIR as the drivers read it: the configuration sourced, so a later line wins
+      code="$( . "$cfg" >/dev/null 2>&1; printf '%s' "${CODE_DIR:-.}" )" || code=.
+      # Only a code folder wo would take (no absolute path, no leading -, no ..): the file never lands outside the
+      # scratch folder; any other value is left for wo to refuse, and the probe reports it.
+      case "$code" in .|/*|-*|..|../*|*/..|*/../*) ;; *) { mkdir -p "$tmp/$code" && printf 'probe\n' > "$tmp/$code/probe.txt"; } || true;; esac
+      probe="$tmp/.acp-doctor-probe.sh"
+      printf '#!/usr/bin/env bash\nexit 0\n' > "$probe" && chmod +x "$probe"
+      # a wo new that fails prints no number: under pipefail a grep that finds none ended doctor with no word
+      pn="$(cd "$tmp" && "$dest/bin/wo" new "acp doctor probe" --size trivial --area docs 2>/dev/null | { grep -o 'WO-[0-9]*' || true; } | head -1)" || pn=""
+      if [ -n "$pn" ]; then
+        pn="${pn#WO-}"
+        # The probe's verification document is untouched template, so the placeholder
+        # gate would refuse the close. That gate is for human work, not for this.
+        if ( cd "$tmp" && "$dest/bin/wo" verify "$pn" --run "$probe" >/dev/null 2>&1 \
+               && ALLOW_PLACEHOLDERS=1 "$dest/bin/wo" close "$pn" >/dev/null 2>&1 ); then
+          ok "lifecycle probe: a work order opened, verified and closed in this layout (in a scratch copy)"
+        else bad "lifecycle probe failed: the drivers cannot complete a work order in this layout"; fi
+      else bad "lifecycle probe: wo new failed in this layout"; fi
+      rm -rf "$tmp"
+    fi
   fi
   echo
   if [ "$fail" -gt 0 ]; then echo "$fail failure(s), $warn warning(s)"; return 1; fi
@@ -292,7 +392,7 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   init)          exec "$BIN/new-project" "$@";;
   install)       exec "$BIN/install.sh" "$@";;
-  doctor)        doctor "${1:-}";;
+  doctor)        if [ "${1:-}" = --gitignore-hint ]; then gitignore_hint "${2:-}"; else doctor "${1:-}"; fi;;
   wo)            exec "$BIN/wo" "$@";;
   check)
     # One implementation of the rules, callable from anywhere: wo close, a git
@@ -304,6 +404,15 @@ case "$cmd" in
     fi
     ex+=("${ROOT#$root/}")
     exec python3 "$ROOT/core/hooks/check.py" --root "$root" --exclude "${ex[@]}" "$@";;
+  publish-check)
+    # Before any first push. A push publishes every commit on every branch, so the whole history is
+    # read with bin/sanitize's rules, with the files a commit could still add. It reports; it never
+    # writes, rewrites history, fetches or pushes.
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "acp publish-check: not inside a git repository" >&2; exit 3; }
+    # this pipeline's own place: the repository itself, a folder inside it, or outside it (kept absolute)
+    case "$ROOT" in "$root") pd=.;; "$root"/*) pd="${ROOT#"$root"/}";; *) pd="$ROOT";; esac
+    [ -f "$ROOT/core/hooks/publish-check.py" ] || { echo "acp publish-check: engine missing ($ROOT/core/hooks/publish-check.py)" >&2; exit 3; }
+    exec python3 "$ROOT/core/hooks/publish-check.py" --root "$root" --sanitize "$BIN/sanitize" --pipeline-dir "$pd" "$@";;
   intake)
     # Installation is work, and work here is a work order. Six of them, each with a
     # shipped spec and a shipped suite, and the project is operational when every
@@ -313,15 +422,20 @@ case "$cmd" in
     wod="$(sed -n 's/^export WORKORDERS_DIR="\([^"]*\)".*/\1/p' "$cfg" | head -1)"; wod="${wod:-Workspace/Docs/WorkOrders}"
     bugd="$(sed -n 's/^export BUGS_DIR="\([^"]*\)".*/\1/p' "$cfg" | head -1)"; bugd="${bugd:-Workspace/Docs/Bugs}"
     tdir="$(sed -n 's/^export TESTING_DIR="\([^"]*\)".*/\1/p' "$cfg" | head -1)"; tdir="${tdir:-Workspace/Testing}"
-    rel="${ROOT#$root/}"; T="$ROOT/core/templates/intake"
+    rel="${ROOT#"$root"/}"; T="$ROOT/core/templates/intake"   # the root quoted: a literal, not a pattern
     intake_state() { # step -> closed | verified | open | missing, and the number
       local st="" num="" dd
       for dd in "$root/$wod"/WO-*; do
         [ -f "$dd/.wo-meta" ] && [ "$(sed -n 's/^intake=//p' "$dd/.wo-meta" | head -1)" = "$1" ] || continue
         num="$(basename "$dd")"; num="${num#WO-}"; num="${num%%-*}"
         if ls "$dd" | grep -qi "WO-$num-CLOSEOUT"; then st=closed
-        elif grep -q 'EXECUTED — PASS' "$dd/WO-$num-VERIFICATION.md" 2>/dev/null; then st=verified
-        else st=open; fi
+        else
+          # The document's own status line decides, as wo close reads it: an older passing run in
+          # its history, or a passing copy beside it, does not.
+          local ln; ln="$(grep -m1 -E '^\*\*Overall status:\*\*' "$dd/WO-$num-VERIFICATION.md" 2>/dev/null || true)"
+          ln="${ln#\*\*Overall status:\*\*}"; ln="${ln# }"; st=open
+          case "$ln" in "EXECUTED — PASS"*|"EXECUTED – PASS"*|"EXECUTED - PASS"*) st=verified;; esac
+        fi
         break
       done
       printf '%s %s\n' "${st:-missing}" "$num"
@@ -353,34 +467,144 @@ case "$cmd" in
         for spec in "$T"/INTAKE-0*.md; do
           [ -f "$spec" ] || continue
           step="$(basename "$spec" .md)"; n="${step#INTAKE-}"; n="${n%%-*}"; slug="${step#INTAKE-0?-}"
+          # the step's spec and suite are read before its order is opened: perl only warns "Can't open" and exits 0
+          for t in "$spec" "$T/intake-$n-$slug.sh"; do
+            [ "$t" != "$spec" ] && [ ! -e "$t" ] && continue   # a step without a suite has none to read
+            [ -f "$t" ] && [ -r "$t" ] || { echo "acp intake: template missing or unreadable: $t" >&2; exit 1; }
+          done
           title="$(grep -m1 '^# ' "$spec" | sed 's/^# *WO-XXXX: *//; s/^# *//')"
           set -- $(intake_state "$n"); [ "$1" != missing ] && { kept=$((kept+1)); continue; }
           case "$slug" in knowledge-base) area=analysis;; baseline|suites) area=testing;; *) area=docs;; esac
-          num="$(cd "$root" && "$W" new "$title" --size small --area "$area" 2>/dev/null | grep -o 'WO-[0-9]*' | head -1)"; num="${num#WO-}"
+          # wo new's own refusal (a template it cannot read, say) reaches the person; under pipefail a failing
+          # wo new in a pipe ended intake with no word at all
+          made="$(cd "$root" && "$W" new "$title" --size small --area "$area")" || { echo "acp intake: could not open step $n" >&2; exit 1; }
+          num="$(printf '%s\n' "$made" | { grep -o 'WO-[0-9]*' || true; } | head -1)"; num="${num#WO-}"
           [ -n "$num" ] || { echo "acp intake: could not open step $n" >&2; continue; }
           dd="$(find "$root/$wod" -maxdepth 1 -type d -name "WO-$num-*" | head -1)"
           # the shipped spec replaces the template: complete prose, nothing to fill in
           spec_out="$dd/WO-$num-SPEC.md"
-          { sed -e "s/WO-XXXX/WO-$num/g" -e "s|{{PIPELINE_ROOT}}|$rel|g" "$spec"
+          # the number and the path go in as data, in one pass: a | or & in the path broke sed's program
+          { ACP_T_NUM="$num" ACP_T_PR="$rel" perl -C0 -pe 'BEGIN { %v = ("WO-XXXX" => "WO-$ENV{ACP_T_NUM}", "{{PIPELINE_ROOT}}" => $ENV{ACP_T_PR}) } s/(WO-XXXX|\{\{PIPELINE_ROOT\}\})/$v{$1}/g' "$spec"
             [ -f "$spec_out" ] && awk '/^## Specialists for this work order/{p=1} p' "$spec_out" | sed '1s/^/\n---\n\n/'
           } > "$spec_out.new" && mv "$spec_out.new" "$spec_out"
           printf 'intake=%s\n' "$n" >> "$dd/.wo-meta"
           suite_src="$T/intake-$n-$slug.sh"; suite_dst="$root/$tdir/suites/intake-$n-$slug.sh"
-          if [ -f "$suite_src" ]; then mkdir -p "$(dirname "$suite_dst")"; sed -e "s|{{PIPELINE_ROOT}}|$rel|g" "$suite_src" > "$suite_dst"; chmod +x "$suite_dst"; fi
+          if [ -f "$suite_src" ]; then mkdir -p "$(dirname "$suite_dst")"; ACP_T_PR="$rel" perl -C0 -pe 's/\{\{PIPELINE_ROOT\}\}/$ENV{ACP_T_PR}/g' "$suite_src" > "$suite_dst"; chmod +x "$suite_dst"; fi   # the path goes in as data: a | or & in it is text
           opened=$((opened+1))
           printf '  WO-%s  %s\n' "$num" "$title"
         done
         # The knowledge base is scaffolded here, by the tool, so the step that asks for
         # it can pass on day one at the lite level. Raising the level is agent work.
-        if [ -f "$ROOT/core/hooks/kb.py" ] && python3 "$ROOT/core/hooks/kb.py" scaffold --help >/dev/null 2>&1; then
+        # An upgrade (install says so) never writes the project's knowledge base: it says how to scaffold by hand.
+        if [ "${ACP_INSTALL_UPGRADE:-0}" = 1 ]; then
+          echo "  knowledge base: not touched: an upgrade leaves the project's knowledge base as it is. To create or extend it:  acp kb scaffold"
+        elif [ -f "$ROOT/core/hooks/kb.py" ] && python3 "$ROOT/core/hooks/kb.py" scaffold --help >/dev/null 2>&1; then
           kbd2="$(sed -n 's/^export KNOWLEDGE_DIR="\([^"]*\)".*/\1/p' "$cfg" | head -1)"; kbd2="${kbd2:-Workspace/Docs/KnowledgeBase}"
           lvl2="$(sed -n 's/^export KNOWLEDGE_LEVEL="\([^"]*\)".*/\1/p' "$cfg" | head -1)"; lvl2="${lvl2:-lite}"
-          ( cd "$root" && python3 "$ROOT/core/hooks/kb.py" scaffold --root "$root" --kb "$root/$kbd2" --level "$lvl2" --pipeline-dir "$rel" 2>&1 | tail -1 | sed 's/^/  knowledge base: /' ) || true
+          # Every line the scaffold prints is shown, then every knowledge-base file it added or rewrote, so an
+          # install never changes a document the person cannot see named.
+          kb_snap() { ( cd "$1" 2>/dev/null || exit 0; find . -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do printf '%s\t%s\n' "${f#./}" "$(cksum 2>/dev/null < "$f")"; done ) || true; }
+          kb_before="$(kb_snap "$root/$kbd2")" || kb_before=""
+          ( cd "$root" && python3 -u "$ROOT/core/hooks/kb.py" scaffold --root "$root" --kb "$root/$kbd2" --level "$lvl2" --pipeline-dir "$rel" 2>&1 | sed 's/^/  knowledge base: /' ) || true
+          awk -F '\t' 'NR == FNR { if ($0 != "") b[$1] = $2; next } $0 == "" { next } !($1 in b) { print "  knowledge base: added " $1; next } b[$1] != $2 { print "  knowledge base: rewrote " $1 }' <(printf '%s\n' "$kb_before") <(kb_snap "$root/$kbd2") || true
         fi
         echo "intake: $opened step(s) opened, $kept already present. Each has a shipped suite under $tdir/suites/;"
         echo "        verify a step with  wo verify <n> --run $tdir/suites/intake-0N-<step>.sh   and close it. Then:  acp intake status";;
       *) echo "usage: acp intake [status|inventory]" >&2; exit 1;;
     esac;;
+  layout)
+    # The one writer of the two-folder layout's settings: the code folder and the pipeline folder side by side in
+    # one repository. It rewrites only the location lines of ./pipeline.config.sh, as data, and refuses a config
+    # it cannot read with certainty rather than guess; --check runs the same checks on the config and writes
+    # nothing, so a caller can know before it moves anything. new-project and the migration call it; install checks.
+    pdir="" cdir="" lcheck=""
+    lusage() { echo "usage: acp layout [--check] --pipeline-dir <folder> --code-dir <folder>" >&2; exit 1; }
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --pipeline-dir|--code-dir) [ $# -ge 2 ] && [ -n "$2" ] && [ "${2#-}" = "$2" ] || lusage
+                                   if [ "$1" = --pipeline-dir ]; then pdir="$2"; else cdir="$2"; fi; shift 2;;
+        --check) lcheck=1; shift;;
+        *) lusage;;
+      esac
+    done
+    [ -n "$pdir" ] && [ -n "$cdir" ] || lusage
+    for v in "$pdir" "$cdir"; do
+      case "$v" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*|.*|-*) printf 'acp layout: --pipeline-dir and --code-dir each take one folder name (letters, digits, ".", "_", "-"; not starting with "." or "-"), got: %q\n' "$v" >&2; exit 1;; esac
+      case "$(printf '%s' "$v" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" in
+        workspace|pipeline.config.sh|agents.md|claude.md) printf 'acp layout: %q is a name the layout or the tools use at the top of the repository (in any case); choose another\n' "$v" >&2; exit 1;;
+      esac
+    done
+    [ "$(printf '%s' "$pdir" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" != "$(printf '%s' "$cdir" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" ] \
+      || { echo "acp layout: the pipeline folder and the code folder must differ, also ignoring case" >&2; exit 1; }
+    { [ -f pipeline.config.sh ] && [ ! -L pipeline.config.sh ]; } || { echo "acp layout: no pipeline.config.sh in this folder (run it in the repository root; a link is refused)" >&2; exit 1; }
+    if [ -z "$lcheck" ]; then   # the writer changes nothing while the project is still laid out the old way
+      for x in .aicodepipeline Workspace; do
+        { [ ! -e "$x" ] && [ ! -L "$x" ]; } || { echo "acp layout: $x is still at the top of the repository; move the project with  acp migrate  (plan, backup, then apply) first (pipeline.config.sh is unchanged)" >&2; exit 1; }
+      done
+      { [ -d "$cdir" ] && [ ! -L "$cdir" ]; } || { echo "acp layout: $cdir/ is not a folder in the repository (a link is refused); move the project with  acp migrate  (plan, backup, then apply) first, or make it (pipeline.config.sh is unchanged)" >&2; exit 1; }
+    fi
+    ACP_P="$pdir" ACP_C="$cdir" ACP_CHECK="$lcheck" python3 -I - pipeline.config.sh <<'PYEOF'
+import os, re, sys, tempfile
+path = sys.argv[1]; p, c = os.environ["ACP_P"], os.environ["ACP_C"]
+want = [("PIPELINE_ROOT", p + "/.aicodepipeline"), ("WORKSPACE_DIR", p + "/Workspace"), ("DOCS_DIR", p + "/Workspace/Docs"),
+        ("WORKORDERS_DIR", p + "/Workspace/Docs/WorkOrders"), ("BUGS_DIR", p + "/Workspace/Docs/Bugs"),
+        ("TESTING_DIR", p + "/Workspace/Testing"), ("KNOWLEDGE_DIR", p + "/Workspace/Docs/KnowledgeBase"),
+        ("SESSIONS_DIR", p + "/Workspace/Sessions"), ("CODE_DIR", c), ("PLAYBOOKS_DIR", p + "/playbooks")]
+optional = {"CODE_DIR": "SESSIONS_DIR", "PLAYBOOKS_DIR": "CODE_DIR"}   # added after this line when absent (older configs)
+root_line = 'export PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"'
+def refuse(msg):
+    print("acp layout: " + msg + "; pipeline.config.sh is unchanged", file=sys.stderr); sys.exit(1)
+try:
+    with open(path, encoding="utf-8", newline="") as f: text = f.read()
+except (OSError, UnicodeDecodeError) as e:
+    refuse("cannot read pipeline.config.sh as UTF-8 text (%s)" % e.__class__.__name__)
+if "\r" in text:
+    refuse("pipeline.config.sh holds a carriage return (CRLF line ends); save it with plain line ends")
+lines = text.split("\n")
+for l in lines:   # a line that runs another file could set anything; a config read with certainty runs none
+    if re.match(r"^\s*(\.|source|eval)(\s|$)", l):
+        refuse("pipeline.config.sh runs other code (%r); the layout is set only in a config that does not" % l.strip()[:60])
+plain = re.compile(r'^export ([A-Z_]+)="([^"$`\\]*)"(\s+#.*)?$')
+code = [l for l in lines if not l.lstrip().startswith("#")]   # a whole-line comment is never a definition
+for n in [n for n, _ in want] + ["PROJECT_ROOT"]:
+    uses = [l for l in code if re.search(r"(^|[^A-Za-z0-9_])%s([^A-Za-z0-9_]|$)" % n, l)]
+    if n == "PROJECT_ROOT":
+        if len(uses) != 1 or not re.match(r"^%s(\s+#.*)?$" % re.escape(root_line), uses[0]):
+            old = 'export PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+            hint = " (a config from before 1.2 says pwd: change it to pwd -P)" if any(l.startswith(old) for l in uses) else ""
+            refuse("PROJECT_ROOT must be set once, as this file's own folder, and used nowhere else: " + root_line + hint)
+        continue
+    if not uses and n in optional:
+        continue
+    if not uses and n == "KNOWLEDGE_DIR":
+        refuse('KNOWLEDGE_DIR is not set (a config from before 1.3): add  export KNOWLEDGE_DIR="Workspace/Docs/KnowledgeBase"  after TESTING_DIR, then run this again')
+    if len(uses) != 1 or not plain.match(uses[0]):
+        refuse("%s must be set exactly once, as export %s=\"<value>\" with no $, backtick, quote or backslash, and used nowhere else" % (n, n))
+out, changed = list(lines), []
+for n, v in want:
+    idx = [i for i, l in enumerate(out) if l.startswith("export %s=" % n)]
+    if not idx:
+        j = [i for i, l in enumerate(out) if l.startswith("export %s=" % optional[n])][0]
+        out.insert(j + 1, 'export %s="%s"' % (n, v)); changed.append("%s=%s (added)" % (n, v)); continue
+    m = plain.match(out[idx[0]])
+    if m.group(2) != v:
+        out[idx[0]] = 'export %s="%s"%s' % (n, v, m.group(3) or ""); changed.append("%s=%s (was %s)" % (n, v, m.group(2)))
+if changed and os.environ.get("ACP_CHECK"):
+    print("acp layout: pipeline.config.sh can be set for the %s/ + %s/ layout (nothing written):" % (p, c))
+    for x in changed: print("  " + x)
+elif changed:
+    fd, tmp = tempfile.mkstemp(dir=".", prefix=".pipeline.config.")   # created exclusively, never through a link
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f: f.write("\n".join(out))
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777); os.replace(tmp, path)
+    except OSError:
+        os.unlink(tmp); refuse("could not write the new pipeline.config.sh")
+    print("acp layout: pipeline.config.sh now names the %s/ + %s/ layout:" % (p, c))
+    for x in changed: print("  " + x)
+else:
+    print("acp layout: pipeline.config.sh already names the %s/ + %s/ layout" % (p, c))
+PYEOF
+    ;;
   kb)
     root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
     kbd="Workspace/Docs/KnowledgeBase"
@@ -391,8 +615,15 @@ case "$cmd" in
       status|bind|impact) exec python3 "$py" "$sub" --root "$root" --kb "$root/$kbd" "$@";;
       scaffold)
         lvl="lite"; [ -f "$root/pipeline.config.sh" ] && { v="$(sed -n 's/^export KNOWLEDGE_LEVEL="\([^"]*\)".*/\1/p' "$root/pipeline.config.sh" | head -1)"; [ -n "$v" ] && lvl="$v"; }
-        exec python3 "$py" scaffold --root "$root" --kb "$root/$kbd" --level "$lvl" --pipeline-dir "${ROOT#$root/}" "$@";;
+        exec python3 "$py" scaffold --root "$root" --kb "$root/$kbd" --level "$lvl" --pipeline-dir "${ROOT#$root/}" --legacy-rebuild "$@";;
       *) echo "usage: acp kb status|bind|impact|scaffold" >&2; exit 1;;
+    esac;;
+  migrate)
+    # The move into app/ and acp/. plan reads the project and writes only .acp-migration/.
+    py="$ROOT/core/hooks/migrate.py"; [ -f "$py" ] || { echo "acp migrate: engine missing ($py)" >&2; exit 1; }
+    case "${1:-}" in
+      plan|backup|answer|apply|rollback) exec python3 -I "$py" "$@";;
+      *) printf 'usage: acp migrate plan [--project <dir>] [--repo <dir>] [--replace]\n       acp migrate backup --to <dir> [--project <dir>] [--repo <dir>] | --check [--project <dir>] [--repo <dir>]\n       acp migrate answer <n> <option> | <n> --folder <dir> [--project <dir>]\n       acp migrate apply [--project <dir>] [--repo <dir>]\n       acp migrate rollback [--project <dir>] [--archive <file>] [--accept-repository-changes] [--keep-changes] [--after-interrupted-apply]\n' >&2; exit 1;;
     esac;;
   baseline)
     # The first measurement of a project the tool is about to record evidence
@@ -442,7 +673,12 @@ case "$cmd" in
     for d in "$root/$wod"/WO-*; do
       [ -d "$d" ] || continue; total=$((total+1))
       grep -q '^adopted=' "$d/.wo-meta" 2>/dev/null && adopted=$((adopted+1))
-      if ls "$d" | grep -qi VERIFICATION; then grep -q 'EXECUTED — PASS' "$d"/*VERIFICATION.md 2>/dev/null && verified=$((verified+1)); else nover=$((nover+1)); fi
+      if ls "$d" | grep -qi VERIFICATION; then
+        # the work order's own document, and its status line alone, as wo close reads it
+        ln="$(grep -m1 -E '^\*\*Overall status:\*\*' "$d/$(basename "$d" | cut -d- -f1-2)-VERIFICATION.md" 2>/dev/null || true)"
+        ln="${ln#\*\*Overall status:\*\*}"; ln="${ln# }"
+        case "$ln" in "EXECUTED — PASS"*|"EXECUTED – PASS"*|"EXECUTED - PASS"*) verified=$((verified+1));; esac
+      else nover=$((nover+1)); fi
     done
     {
       printf '# Baseline\n\nThe first measurement of this project under the pipeline. Everything recorded after it is relative to this.\n\n'
@@ -462,9 +698,14 @@ case "$cmd" in
         root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
         dest="$root/.github/workflows/acp-check.yml"
         [ -f "$dest" ] && { echo "acp: $dest exists — left alone"; exit 0; }
+        rel="${ROOT#"$root"/}"
+        # The path is written unquoted into the workflow's shell: anything but plain path characters
+        # there would be split or run, so it is refused before anything is written.
+        case "$rel" in ""|*[!A-Za-z0-9._/@+-]*) echo "acp: the pipeline's path '$rel' holds characters the workflow would split or run; move it under a plain path" >&2; exit 1;; esac
+        t="$ROOT/core/templates/ci/acp-check.yml"   # refused before anything is written: perl exits 0 on a missing file
+        [ -f "$t" ] && [ -r "$t" ] || { echo "acp: template missing or unreadable: $t" >&2; exit 1; }
         mkdir -p "$(dirname "$dest")"
-        rel="${ROOT#$root/}"
-        sed "s|{{PIPELINE_ROOT}}|$rel|g" "$ROOT/core/templates/ci/acp-check.yml" > "$dest"
+        ACP_T_PR="$rel" perl -C0 -pe 's/\{\{PIPELINE_ROOT\}\}/$ENV{ACP_T_PR}/g' "$ROOT/core/templates/ci/acp-check.yml" > "$dest"
         echo "wrote ${dest#$root/}: the rules run on every pull request, whoever made the commits";;
       *) echo "usage: acp ci github" >&2; exit 1;;
     esac;;
@@ -477,10 +718,11 @@ case "$cmd" in
       skills)   for d in "$ROOT"/core/skills/*/ "$ROOT"/core/skill-sets/*/*/; do [ -f "$d/SKILL.md" ] || continue; printf '  %-34s %s\n' "$(basename "$d")" "$(sed -n 's/^description: *//p' "$d/SKILL.md" | head -1 | cut -c1-80)"; done;;
       command)  n="${1:-}"; [ -n "$n" ] || { echo "usage: acp command <name>   (acp commands lists them)" >&2; exit 1; }
                 f="$ROOT/core/commands/$n.md"; [ -f "$f" ] || { echo "acp: no command named '$n'" >&2; exit 1; }
+                [ -r "$f" ] || { echo "acp: template missing or unreadable: $f" >&2; exit 1; }   # refused before anything is printed: perl exits 0 on a file it cannot read
                 echo "# /$n — read this as your instructions; where it says to load a skill, run:  acp skill <name>"; echo
-                sed -e "s|{{PIPELINE_ROOT}}|${ROOT#$root/}|g" "$f";;
+                ACP_T_PR="${ROOT#"$root"/}" perl -C0 -pe 's/\{\{PIPELINE_ROOT\}\}/$ENV{ACP_T_PR}/g' "$f";;   # as data
       skill)    n="${1:-}"; [ -n "$n" ] || { echo "usage: acp skill <name>   (acp skills lists them)" >&2; exit 1; }
-                for c in "$ROOT/core/skills/$n/SKILL.md" "$ROOT"/core/skill-sets/*/"$n"/SKILL.md "$root/.claude/skills/$n/SKILL.md"; do [ -f "$c" ] && { sed -e "s|{{PIPELINE_ROOT}}|${ROOT#$root/}|g" "$c"; exit 0; }; done
+                for c in "$ROOT/core/skills/$n/SKILL.md" "$ROOT"/core/skill-sets/*/"$n"/SKILL.md "$root/.claude/skills/$n/SKILL.md"; do [ -f "$c" ] && { [ -r "$c" ] || { echo "acp: template missing or unreadable: $c" >&2; exit 1; }; ACP_T_PR="${ROOT#"$root"/}" perl -C0 -pe 's/\{\{PIPELINE_ROOT\}\}/$ENV{ACP_T_PR}/g' "$c"; exit 0; }; done   # the path goes in as data
                 echo "acp: no skill named '$n'" >&2; exit 1;;
     esac;;
   agent)
@@ -522,7 +764,28 @@ case "$cmd" in
     done
     if [ -f "$ROOT/pipeline.config.example.sh" ]; then echo "== evaluations (pipeline repository: full suite)"
     else echo "== evaluations (installed copy: the ones needing source fixtures are skipped)"; fi
-    "$BIN/eval" run || rc=1
+    tmpbase="${TMPDIR:-/tmp}"; elog="$(mktemp "${tmpbase%/}/acp-test-eval.XXXXXX")"
+    er=0; "$BIN/eval" run 2>&1 | tee "$elog" || er=$?
+    [ "$er" -eq 0 ] || rc=1
+    existing=0; for f in "$ROOT"/harness/evals/*/eval.sh; do [ -f "$f" ] && existing=$((existing+1)); done
+    may_skip=0
+    if [ ! -f "$ROOT/pipeline.config.example.sh" ]; then
+      for f in "$ROOT"/harness/evals/*/.source-only; do [ -f "$f" ] && may_skip=$((may_skip+1)); done
+    fi
+    sline="$(grep '^eval-summary: ' "$elog" | tail -1 || true)"; rm -f "$elog"
+    if [ "$existing" -eq 0 ]; then echo "  evaluations FAIL: no evaluations found under harness/evals"; rc=1
+    elif [ -z "$sline" ]; then echo "  evaluations FAIL: eval run printed no summary line"; rc=1
+    else
+      sp="$(printf '%s\n' "$sline" | sed -n 's/.*passed=\([0-9][0-9]*\).*/\1/p')"
+      sf="$(printf '%s\n' "$sline" | sed -n 's/.*failed=\([0-9][0-9]*\).*/\1/p')"
+      ss="$(printf '%s\n' "$sline" | sed -n 's/.*skipped=\([0-9][0-9]*\).*/\1/p')"
+      if [ -z "$sp" ] || [ -z "$sf" ] || [ -z "$ss" ]; then echo "  evaluations FAIL: eval run printed no summary line"; rc=1
+      elif [ $((sp + sf + ss)) -ne "$existing" ] || [ "$ss" -ne "$may_skip" ]; then
+        echo "  evaluations FAIL: $((sp + sf)) ran and $ss skipped, but $existing exist ($may_skip may be skipped here)"; rc=1
+      else echo "  evaluations: $((sp + sf)) of $existing ran ($ss skipped by design)"
+        if [ "$sf" -gt 0 ] && [ "$er" -eq 0 ]; then echo "  evaluations FAIL: eval run reported $sf failed but exited 0"; rc=1; fi
+      fi
+    fi
     # Assembling the plugin is something only the pipeline repository can do; an
     # installed copy has no inputs for it, and failing it there would be noise.
     if [ -f "$ROOT/pipeline.config.example.sh" ]; then

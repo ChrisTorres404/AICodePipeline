@@ -1,0 +1,3 @@
+# migrate-answer
+
+Proves: acp migrate answer records the owner's answer to one question of the plan only from a moves.json and MIGRATION-PLAN.md that are the plan written for this project (the same plan id, MIGRATION-PLAN.md's every byte, the project by device and inode), only one of the question's options exactly (or an absolute folder outside the project, however spelled, where the plan asks for one), changes nothing else in moves.json, MIGRATION-PLAN.md or .acp-migration, and refuses with one line, changing nothing, on a wrong option, an unknown question, plan files that are not the same plan, a copy of the project, a linked moves.json or .acp-migration, no plan, or while another acp migrate holds .acp-migration's lock.

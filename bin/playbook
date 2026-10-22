@@ -18,17 +18,88 @@
 #   playbook show <WO-####|BUG-####>  list a folder's documents
 #   playbook catalog [name]           rebuild CATALOG.md from catalog/ (promotions write entries there)
 #   playbook index                    regenerate playbooks/INDEX.md
+#   playbook where [--project D]      print the playbooks folder (PLAYBOOKS_DIR), or refuse it
 #
 # Scope to one playbook with PLAYBOOK=<name>, e.g. PLAYBOOK=my-domain playbook wo caching
 # ---------------------------------------------------------------------------
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-# PACKS_DIR was the name before 1.4.0 and is still honoured. An install that has
-# not been migrated yet still has its content under packs/.
-PLAYBOOKS="${PLAYBOOKS_DIR:-${PACKS_DIR:-}}"
-if [ -z "$PLAYBOOKS" ]; then
-  if [ ! -d "$ROOT/playbooks" ] && [ -d "$ROOT/packs" ]; then PLAYBOOKS="$ROOT/packs"; else PLAYBOOKS="$ROOT/playbooks"; fi
+# The playbooks folder, decided here alone; wo, bug, install, new-project and doctor ask `playbook where`.
+# PLAYBOOKS_DIR (or PACKS_DIR, its name before 1.4.0) from the environment, else read as data from this install's
+# own pipeline.config.sh (the first one above it whose PIPELINE_ROOT is this install; --project names it), is
+# relative to the project like every *_DIR, or absolute. A relative one lies under the pipeline's or the
+# workspace's top folder; no spelling or link of it lies in the code folder, where the fingerprint would read
+# promoted playbooks as code. Anything else is refused. Unset, the folder is inside the install, as before.
+pbq() { printf 'playbook: %s\n' "$1" >&2; exit "${2:-1}"; }
+PR1='$PROJECT_ROOT/' PR2='${PROJECT_ROOT}/'
+cfgv() { # <NAME>: its value in $PCFG, read as data, "" when unset; status 2 when it is set some other way
+  local all v; all="$(grep -v '^[[:space:]]*#' "$PCFG" | grep -cE "(^|[^A-Za-z0-9_])$1=" || true)"
+  [ "$all" -eq 0 ] && return 0
+  v="$(sed -n "s/^export $1=\"\([^\"]*\)\".*/\1/p" "$PCFG")"; v="${v#"$PR1"}"; v="${v#"$PR2"}"
+  [ "$all" -eq 1 ] && [ -n "$(sed -n "/^export $1=\"[^\"]*\"/p" "$PCFG")" ] || return 2
+  case "$v" in *'$'*|*'`'*|*\\*) return 2;; esac; printf '%s' "$v"
+}
+PCFG="" PROJ="" BASE="$ROOT"
+if [ "${1:-}" = where ] && [ "${2:-}" = --project ]; then
+  [ -f "${3:-}/pipeline.config.sh" ] || pbq "usage: playbook where [--project <folder holding pipeline.config.sh>]"
+  PCFG="$3/pipeline.config.sh"; PROJ="$(cd "$3" && pwd -P)"
+  pr="$(cfgv PIPELINE_ROOT)" && [ -n "$pr" ] || pbq "pipeline.config.sh sets PIPELINE_ROOT in a form that cannot be read as data"
+  BASE="$PROJ/$pr"
+else
+  d="$ROOT"; while [ "$d" != / ] && [ ! -f "$d/pipeline.config.sh" ]; do d="$(dirname "$d")"; done
+  if [ -f "$d/pipeline.config.sh" ]; then
+    PCFG="$d/pipeline.config.sh"; pr="$(cfgv PIPELINE_ROOT || true)"
+    if [ -n "$pr" ] && [ "$(cd "$d" && cd "$pr" 2>/dev/null && pwd -P)" = "$ROOT" ]; then PROJ="$(cd "$d" && pwd -P)"; else PCFG=""; fi
+  fi
 fi
+PLAYBOOKS="${PLAYBOOKS_DIR:-${PACKS_DIR:-}}"
+if [ -z "$PLAYBOOKS" ] && [ -n "$PCFG" ]; then
+  rc=0; PLAYBOOKS="$(cfgv PLAYBOOKS_DIR)" || rc=$?
+  [ "$rc" -eq 0 ] || pbq "pipeline.config.sh sets PLAYBOOKS_DIR in a form that cannot be read as data; write it as  export PLAYBOOKS_DIR=\"<folder>\"" 2
+fi
+if [ -z "$PLAYBOOKS" ]; then
+  if [ ! -d "$BASE/playbooks" ] && [ -d "$BASE/packs" ]; then PLAYBOOKS="$BASE/packs"; else PLAYBOOKS="$BASE/playbooks"; fi
+else
+  pbraw="$PLAYBOOKS"; pbbad() { pbq "$(printf 'PLAYBOOKS_DIR %q %s' "$pbraw" "$1")"; }
+  case "$PLAYBOOKS" in *$'\n'*|*$'\r'*|-*) pbbad "must be a folder path, not starting with -";; esac
+  pbs=//; while case "$PLAYBOOKS" in *//*) true;; *) false;; esac; do PLAYBOOKS="${PLAYBOOKS//$pbs//}"; done   # a//b names the folder a/b
+  case "$PLAYBOOKS" in /*) pbabs=1;; *) pbabs=""; PLAYBOOKS="${PLAYBOOKS#./}";; esac
+  while [ "${PLAYBOOKS%/}" != "$PLAYBOOKS" ]; do PLAYBOOKS="${PLAYBOOKS%/}"; done
+  case "$PLAYBOOKS" in ''|.|..|../*|*/..|*/../*|*/./*|*/.|./*) pbbad "must be a folder path without . or ..";; esac
+  [ -n "$pbabs" ] || [ -n "$PROJ" ] || pbbad "is relative, but no pipeline.config.sh names this install, so there is no project to resolve it in"
+  pbcode="."
+  if [ -n "$PROJ" ]; then
+    rc=0; pbcode="$(cfgv CODE_DIR)" || rc=$?; [ "$rc" -eq 0 ] || pbbad "cannot be checked: pipeline.config.sh sets CODE_DIR in a form that cannot be read as data"
+    pbcode="${pbcode:-${CODE_DIR:-.}}"; pbcode="${pbcode#./}"; while [ "${pbcode%/}" != "$pbcode" ]; do pbcode="${pbcode%/}"; done; pbcode="${pbcode:-.}"
+  fi
+  pbrel() { # <path relative to the project>: beside the pipeline and the workspace, outside the code folder
+    [ "$pbcode" != . ] || pbbad "lies inside the code folder (CODE_DIR is the whole project): the fingerprint would read promoted playbooks as code"
+    local t1 t2; t1="$(cfgv PIPELINE_ROOT || true)"; t1="${t1#./}"; t2="$(cfgv WORKSPACE_DIR || true)"; t2="${t2#./}"
+    case "${1%%/*}" in "${t1%%/*}"|"${t2%%/*}") ;; *) pbbad "must lie under ${t1%%/*}/ or ${t2%%/*}/, beside the pipeline and the workspace";; esac
+  }
+  [ -n "$pbabs" ] || pbrel "$PLAYBOOKS"
+  # The folder as it is on disk: its deepest existing folder with every link resolved, then the part still to be
+  # made, none of which may exist yet (a file or a link to nothing on the way is refused).
+  d="$PLAYBOOKS"; [ -n "$pbabs" ] || d="$PROJ/$PLAYBOOKS"; rest=""
+  while [ ! -d "$d" ]; do
+    { [ ! -e "$d" ] && [ ! -L "$d" ]; } || pbbad "is not a folder (a file, or a link to nothing)"
+    rest="/${d##*/}$rest"; d="$(dirname "$d")"
+  done
+  d="$(cd "$d" && pwd -P)"
+  if [ -n "$PROJ" ]; then   # each folder above it on disk: never the code folder; inside the project, the relative rules hold
+    a="$d" inproj=""
+    while :; do
+      [ "$pbcode" = . ] || [ ! "$a" -ef "$PROJ/$pbcode" ] || pbbad "lies inside the code folder ($pbcode), through a link or another spelling: the fingerprint would read promoted playbooks as code"
+      [ -n "$inproj" ] || [ ! "$a" -ef "$PROJ" ] || inproj="$a"
+      [ "$a" != / ] || break; a="$(dirname "$a")"
+    done
+    if [ -n "$pbabs" ] && [ -n "$inproj" ]; then
+      pbr="${d#"$inproj"}$rest"; pbr="${pbr#/}"; [ -n "$pbr" ] || pbbad "is the project itself"; pbrel "$pbr"
+    fi
+  fi
+  PLAYBOOKS="${d%/}$rest"
+fi
+[ "${1:-}" != where ] || { printf '%s\n' "$PLAYBOOKS"; exit 0; }
 [ -d "$PLAYBOOKS" ] || mkdir -p "$PLAYBOOKS"
 
 SELECTED="${PLAYBOOK:-${PACK:-}}"
@@ -81,10 +152,13 @@ search_sub() { # subdir term label — folders under the playbook whose document
   local sub="$1" term="$2" label="$3" any=0 hits
   for r in "${ROOTS[@]+"${ROOTS[@]}"}"; do
     [ -d "$r/$sub" ] || continue
-    hits="$(grep -rils --include='*.md' -- "$term" "$r/$sub" 2>/dev/null | grep -v '\.log$\|\.wo-meta' | xargs -n1 dirname 2>/dev/null | sort -u | head -20 || true)"
+    # Paths are read as lines and cut as data: xargs split a folder name at a space and stopped at a
+    # quote, and the prefix went into sed program text, so a | or & in the playbooks path broke it.
+    hits="$(grep -rils --include='*.md' -- "$term" "$r/$sub" 2>/dev/null | { grep -v -e '\.log$' -e '\.wo-meta' || true; } \
+      | while IFS= read -r f; do printf '%s\n' "${f%/*}"; done | sort -u | head -20 || true)"
     [ -z "$hits" ] && continue
     [ "$any" -eq 0 ] && { hl "$label"; any=1; }
-    echo "$hits" | sed "s|$PLAYBOOKS/|  |"
+    printf '%s\n' "$hits" | while IFS= read -r h; do printf '  %s\n' "${h#"$PLAYBOOKS"/}"; done
   done
   [ "$any" -eq 1 ] && echo
   return 0
@@ -161,7 +235,7 @@ MD
     id="${2:?usage: playbook show <WO-####|BUG-####>}"; found=0
     for r in "${ROOTS[@]+"${ROOTS[@]}"}"; do
       while IFS= read -r d; do
-        found=1; hl "${d#$PLAYBOOKS/}"; ls "$d" | sed 's/^/    /'; echo
+        found=1; hl "${d#"$PLAYBOOKS"/}"; ls "$d" | sed 's/^/    /'; echo   # the prefix quoted: a literal, not a pattern
       done < <(find "$r" -type d -iname "${id}*" 2>/dev/null)
     done
     if [ "$found" -eq 0 ]; then echo "playbook: no folder matching $id" >&2; exit 1; fi
@@ -249,5 +323,5 @@ PYEOF
     } > "$out"
     echo "wrote $out ($(wc -l < "$out" | tr -d ' ') lines)"
     ;;
-  *) sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1;;
+  *) sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1;;
 esac

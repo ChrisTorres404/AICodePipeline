@@ -158,7 +158,7 @@ diff "$EVAL_TMP/auth-before.md" "$KB/profiles/auth.md" >/dev/null \
 [ -f "$KB/profiles/search.md" ] || die "a new feature directory got no profile"
 [ -f "$KB/profiles/util.md" ] || die "the profile of a deleted feature was deleted"
 grep -q "^status: orphaned" "$KB/profiles/util.md" || { echo "the vanished feature is not marked orphaned:"; sed -n '1,14p' "$KB/profiles/util.md"; exit 1; }
-echo "$out" | grep -q "orphaned (the directory is gone; the profile is kept): util" || die "the scaffold did not list the orphan" "$out"
+echo "$out" | grep -q "orphaned (none of the paths it covers exists; the profile is kept): util" || die "the scaffold did not list the orphan" "$out"
 echo "$out" | grep -q "1 profile(s) written, 3 kept, 1 orphaned" || die "the scaffold miscounted what it did" "$out"
 out="$(K status 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || die "an orphaned profile left status at $rc; a kept record is not a failure" "$out"
@@ -189,7 +189,7 @@ printf 'export function login(user) { return user; }\n' > "$G/src/auth/login.ts"
 mkdir -p "$G/src/search"; printf 'export function query() {}\n' > "$G/src/search/q.ts"
 out="$(python3 "$KB_PY" scaffold --root "$G" --kb "$GKB" --grow 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || die "scaffold --grow exited $rc" "$out"
-echo "$out" | grep -q "^grow: 1 profiles added (search), 0 orphaned" || die "--grow did not report what it added" "$out"
+echo "$out" | grep -q "^grow: 1 profiles added (search)$" || die "--grow did not report what it added" "$out"
 [ -f "$GKB/profiles/search.md" ] || die "--grow wrote no profile for the new feature"
 grep -v '^#' "$GKB/source-index.tsv" | LC_ALL=C sort > "$EVAL_TMP/rows-after"
 comm -23 "$EVAL_TMP/rows-before" "$EVAL_TMP/rows-after" | grep -q . \

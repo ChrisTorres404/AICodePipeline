@@ -18,7 +18,7 @@ feature, a status matrix, and `source-index.tsv` — the machine-readable
 binding this tool writes and reads.
 
   kb.py scaffold --root <dir> --kb <dir> [--level lite|standard|full]
-                 [--pipeline-dir <rel>] [--grow] [--force]
+                 [--pipeline-dir <rel>] [--grow [--check]] [--force]
                                                   build the knowledge base from
                                                   the tree, then bind it
   kb.py bind   --root <dir> --kb <dir>            record a hash per cited file
@@ -55,20 +55,25 @@ base to report on, 4 everything is current but something falls short of the
 level. 4 is reported only when nothing is stale or broken; the count of profiles
 short of the level is on the summary line either way. impact: 0 nothing
 affected, 1 at least one profile describes the change. bind: 0, or 1 when the
-directory holds no profiles. scaffold: 0, or 1 when it cannot write.
+directory holds no profiles. scaffold: 0, or 1 when it cannot write; with --grow,
+3 when a profile's covered paths are gone (reported, never rewritten).
 
 `wo close` and `acp check` call `impact` to say "this change touched files these
 profiles describe". Re-writing the profile is agent work and always was; this
 tool only knows, and says, when it is due. `scaffold --grow` is the close-time
-form: it adds profiles for features that have none and marks vanished ones
-orphaned, and it re-binds nothing, so a profile describing code that just changed
-stays stale until someone updates it.
+form: it adds profiles for features no profile covers, reports any profile none of
+whose covered paths exists, changes no existing profile, and re-binds nothing, so a
+profile describing code that just changed stays stale until someone updates it. A
+profile is judged by the paths it covers (its SOURCE citations and its Covers line,
+or its feature key when it names no path), never by whether the scaffold's own
+grouping has a feature of that name. `scaffold --grow --check` reports the same and
+writes nothing, so `wo close` can refuse before anything is on disk.
 
 The rules it shares with the hooks — the SOURCE comment's spelling, the source
 extensions, the directories no rule reads, the hash — are imported from them,
 so the engine and the hooks cannot drift apart.
 """
-import argparse, hashlib, importlib.util, json, os, re, subprocess, sys
+import argparse, glob, hashlib, importlib.util, json, os, re, subprocess, sys
 from datetime import date
 
 # Reading a project must not leave bytecode behind in the installed pipeline.
@@ -158,6 +163,101 @@ def citations(doc_path, root):
         seen.add((ref, hi))
         out.append((ref, hi, resolve(ref, doc_path, root)))
     return out
+
+
+COVERS_RX = re.compile(r"^\*\*Covers:\*\*(.*)$", re.M)
+GLOB_CHARS = set("*?[")
+PATH_EXT_RX = re.compile(r"\.[A-Za-z0-9]{1,8}$")
+NOT_PATH_RX = re.compile(r"[\s(){}=,;\"'<>|]")
+
+
+def path_spelling(item):
+    """One Covers item in the spelling the file system uses: backslashes become slashes, a leading `./` goes, a trailing
+    slash goes, and `a/../b` is folded. None for an item that cannot be a path (a function name, a phrase)."""
+    c = item.strip().replace("\\", "/")
+    if not c or NOT_PATH_RX.search(c):
+        return None
+    c = slash(os.path.normpath(c)) if not (GLOB_CHARS & set(c)) else re.sub(r"^(\./)+", "", c).rstrip("/")
+    return None if c in ("", ".") else c
+
+
+def locate(p, root, doc_dir):
+    """The existing paths, relative to the root, that one spelling names. It is tried against the root and against the
+    profile's own folder, the two places `resolve()` tries for a citation; a wildcard counts for every file it matches."""
+    bases = [p] if os.path.isabs(p) else [os.path.join(root, p), os.path.join(doc_dir, p)]
+    found = []
+    for b in bases:
+        hits = glob.glob(b, recursive=True) if GLOB_CHARS & set(p) else ([b] if os.path.exists(b) else [])
+        found += [rel_to(root, os.path.normpath(h)) for h in hits]
+    return sorted(set(found))
+
+
+def covered_paths(path, root):
+    """[(the path as the profile writes it, [the existing paths it names, relative to the root])] for every SOURCE citation
+    and every path on the profile's **Covers:** line. A profile is about these. Whether the scaffold's own grouping has a
+    feature of the same name says nothing about whether they still exist: a profile written by hand may split a directory
+    more finely than the scaffold groups it. A Covers item that is not a path (`run()`, a class name) is skipped; one that
+    has no slash and no extension counts only when it exists, since a word cannot be told from a gone directory."""
+    doc_dir, out, seen = os.path.dirname(path), [], set()
+    for ref, _hi, res in citations(path, root):
+        if ref in seen:
+            continue
+        seen.add(ref)
+        if res:
+            out.append((ref, [rel_to(root, os.path.normpath(res))]))
+        else:
+            p = path_spelling(ref)
+            out.append((ref, locate(p, root, doc_dir) if p else []))
+    m = COVERS_RX.search(read(path))
+    for item in re.findall(r"`([^`]+)`", m.group(1)) if m else []:
+        p = path_spelling(item)
+        if p is None or item in seen:
+            continue
+        found = locate(p, root, doc_dir)
+        if not found and "/" not in p and not PATH_EXT_RX.search(p) and not (GLOB_CHARS & set(p)):
+            continue          # a bare word that names nothing here: not a claim about a path
+        seen.add(item)
+        out.append((item, found))
+    return out
+
+
+def key_slug(rel):
+    """The feature key `feature_slug` gives a directory, without the numbering it adds to keep names apart."""
+    parts = [p for p in rel.split("/") if p not in (".", "")]
+    kept = [p for p in parts if p not in SLUG_NOISE] or parts
+    return re.sub(r"[^a-z0-9._-]+", "-", "-".join(kept).lower()).strip("-._")
+
+
+def key_dirs(root, kb):
+    """{feature key: directory} for every directory under the root that feature discovery would walk, so a profile that
+    names no path can be checked through its feature key."""
+    out = {}
+    def walk(d, depth):
+        if depth > 8:
+            return
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            return
+        for n in names:
+            full = os.path.join(d, n)
+            if os.path.isdir(full) and not skip_feature_dir(n, full, kb):
+                out.setdefault(key_slug(rel_to(root, full)), rel_to(root, full))
+                walk(full, depth + 1)
+    walk(root, 0)
+    return out
+
+
+def describing(unit_files, root, covers):
+    """The profile that already covers one of a unit's files (a citation of the file, a directory holding it, or a
+    wildcard matching it), or None."""
+    rels = [rel_to(root, f) for f in unit_files]
+    for slug, items in sorted(covers.items()):
+        for _shown, found in items:
+            for c in found:
+                if any(r == c or r.startswith(c + "/") for r in rels):
+                    return slug
+    return None
 
 
 def profiles_of(kb, root):
@@ -444,7 +544,32 @@ def skip_feature_dir(name, full, kb):
         return True
     if os.path.realpath(full) == kb:
         return True
+    # The pipeline's own document folders are its working documents, not a feature, even when a helper script is kept
+    # there. A conventional code root stays a candidate whatever it holds, and a code folder that merely contains the
+    # knowledge base (server/ for server/docs/kb) is walked: only the folders named below are passed over.
+    if os.path.realpath(full) in DOC_DIRS and name not in CONVENTIONAL_ROOTS \
+            and name not in {parent for parent, _child in CONVENTIONAL_NESTED}:
+        return True
     return is_pipeline_dir(full)
+
+
+DOC_DIRS = set()
+DOC_DIR_SETTINGS = (("WORKSPACE_DIR", "Workspace"), ("DOCS_DIR", "Workspace/Docs"))
+
+
+def set_doc_dirs(root, kb):
+    """The pipeline's own document folders: the folder that holds the knowledge base, and the workspace and documents
+    folders the project's pipeline.config.sh names (WORKSPACE_DIR, DOCS_DIR), from the environment, else from that file,
+    else the defaults. The project root is never one of them."""
+    cfg = read(os.path.join(root, "pipeline.config.sh"))
+    dirs = {os.path.dirname(kb)}
+    for var, default in DOC_DIR_SETTINGS:
+        m = re.search(r'^\s*export\s+' + var + r'="([^"]*)"', cfg, re.M)
+        v = os.environ.get(var) or (m.group(1) if m else default)
+        if v:
+            dirs.add(v if os.path.isabs(v) else os.path.join(root, v))
+    DOC_DIRS.clear()
+    DOC_DIRS.update(os.path.realpath(d) for d in dirs if os.path.realpath(d) != os.path.realpath(root))
 
 
 def dir_entries(d, kb):
@@ -556,10 +681,19 @@ def title_of(slug):
 
 def cite(root, path, line=1):
     """A citation to a line that is there. A citation past the end of the file is
-    what `status` calls broken, so the scaffold clamps rather than writes one."""
+    what `status` calls broken, so the scaffold clamps rather than writes one, and
+    an empty file, which has no line to cite, gets a note instead of a citation."""
     rp = rel_to(root, path)
     n = line_count(path)
-    return f"<!-- SOURCE: {rp}:L{max(1, min(int(line), n) if n else 1)} -->"
+    if not n:
+        return "(an empty file, nothing to cite)"
+    return f"<!-- SOURCE: {rp}:L{max(1, min(int(line), n))} -->"
+
+
+def first_citable(files):
+    """The first file with a line in it, so a feature's own citation is never an empty
+    package marker; the first file when every one is empty."""
+    return next((f for f in files if line_count(f)), files[0])
 
 
 def first_decl_line(path):
@@ -786,7 +920,7 @@ def build_profile(root, tpl, slug, unit_dir, files, endpoints, models, today):
     from the tree and the rest left as the prompts they are until someone writes
     them. Everything generated carries the file and line it was read from."""
     name, rel_dir = title_of(slug), rel_to(root, unit_dir)
-    first = files[0]
+    first = first_citable(files)
     head, sections = split_sections(tpl)
     # `src/billing` belongs to Billing, not to src: the wrapper directory names the
     # layout, and only a multi-part slug (apps/web/src/auth) carries a real grouping.
@@ -820,7 +954,7 @@ def build_profile(root, tpl, slug, unit_dir, files, endpoints, models, today):
                 lines += ["| Marker | Path | Source |", "|---|---|---|"]
                 for e in mine[:60]:
                     lines.append(f"| `{e['marker']}` | `{e['path']}` | "
-                                 f"<!-- SOURCE: {e['file']}:L{e['line']} --> |")
+                                 f"{cite(root, os.path.join(root, e['file']), e['line'])} |")
             else:
                 lines.append("The scaffold's route patterns matched nothing under this directory.")
             lines += ["", "### Data models under this feature", ""]
@@ -828,7 +962,7 @@ def build_profile(root, tpl, slug, unit_dir, files, endpoints, models, today):
             if mym:
                 lines += ["| File | Why it reads as a model | Source |", "|---|---|---|"]
                 for m in mym[:60]:
-                    lines.append(f"| `{m['file']}` | {m['why']} | <!-- SOURCE: {m['file']}:L{m['line']} --> |")
+                    lines.append(f"| `{m['file']}` | {m['why']} | {cite(root, os.path.join(root, m['file']), m['line'])} |")
             else:
                 lines.append("The scaffold's model patterns matched nothing under this directory.")
             lines += ["", "---"]
@@ -896,7 +1030,7 @@ def build_analysis(root, today, level, ctx):
         w(f"- Package manager: {pm}. {cite(root, manifest, 1)}")
         w(f"- Package manifest: `{man_rel}`, {line_count(manifest)} line(s). {cite(root, manifest, 1)}")
     else:
-        first = units[0]["files"][0] if units else None
+        first = first_citable(units[0]["files"]) if units else None
         w(f"- No package manifest of a shape the detector reads sits at the root, so the stack below is")
         w(f"  read from the file extensions alone." + (f" {cite(root, first, 1)}" if first else ""))
         if stack.get("languages"):
@@ -918,7 +1052,7 @@ def build_analysis(root, today, level, ctx):
     w("|---|---|---|---|---|---|")
     for u in units:
         w(f"| {title_of(u['slug'])} | `{rel_to(root, u['dir'])}` | {len(u['files'])} | "
-          f"{sum(line_count(f) for f in u['files'])} | `profiles/{u['slug']}.md` | {cite(root, u['files'][0], 1)} |")
+          f"{sum(line_count(f) for f in u['files'])} | `profiles/{u['slug']}.md` | {cite(root, first_citable(u['files']), 1)} |")
     w("")
     w("---")
     w("")
@@ -944,7 +1078,7 @@ def build_analysis(root, today, level, ctx):
         w("| Marker | Path | File | Source |")
         w("|---|---|---|---|")
         for e in ctx["endpoints"]:
-            w(f"| `{e['marker']}` | `{e['path']}` | `{e['file']}` | <!-- SOURCE: {e['file']}:L{e['line']} --> |")
+            w(f"| `{e['marker']}` | `{e['path']}` | `{e['file']}` | {cite(root, os.path.join(root, e['file']), e['line'])} |")
     else:
         w("None of the route patterns the scaffold knows matched anything in this tree.")
     w("")
@@ -959,7 +1093,7 @@ def build_analysis(root, today, level, ctx):
         w("| File | Why it reads as a model | Source |")
         w("|---|---|---|")
         for m in ctx["models"]:
-            w(f"| `{m['file']}` | {m['why']} | <!-- SOURCE: {m['file']}:L{m['line']} --> |")
+            w(f"| `{m['file']}` | {m['why']} | {cite(root, os.path.join(root, m['file']), m['line'])} |")
     else:
         w("None of the model patterns the scaffold knows matched anything in this tree.")
     w("")
@@ -1050,7 +1184,7 @@ def build_matrix(root, today, level, units, badges):
          "| Feature | Status | Profile | Source files | Source |", "|---|---|---|---|---|"]
     for u in units:
         L.append(f"| {title_of(u['slug'])} | `{badges.get(u['slug'], 'undocumented')}` | "
-                 f"`profiles/{u['slug']}.md` | {len(u['files'])} | {cite(root, u['files'][0], 1)} |")
+                 f"`profiles/{u['slug']}.md` | {len(u['files'])} | {cite(root, first_citable(u['files']), 1)} |")
     if not units:
         L.append("| — | — | — | 0 | — |")
         L.append("")
@@ -1158,15 +1292,85 @@ def discover(root, kb, pipeline_dir):
             "tree": tree_hash(root, pipeline_dir, [rel_to(root, f) for f in all_files])}
 
 
-def write_if_scaffold(path, text, force):
-    """Write, unless the file on disk is someone's own writing. A document the
-    scaffold wrote carries its marker; one without it was written by an agent or a
-    person, and overwriting it would destroy the very thing this exists to produce."""
-    if os.path.isfile(path) and not force and SCAFFOLD_MARK not in read(path):
+def scaffold_view(text):
+    """The document as the scaffold judges it: its own hash line left out, and the orphaned mark
+    the scaffold writes on a profile whose code is gone read as the status it replaced. Neither
+    is an edit."""
+    m = FM_RX.match(text)
+    if not m:
+        return text
+    body = [ln for ln in m.group(1).split("\n") if not re.match(r"scaffold_sha256\s*:", ln)]
+    body = ["status: SCAFFOLD" if ln == "status: orphaned" else ln for ln in body]
+    return "---\n" + "\n".join(body) + "\n---\n" + text[m.end():]
+
+
+def seal(text):
+    """The document with the hash of what the scaffold wrote as its last frontmatter key, so a
+    later run can tell whether anyone has changed it since."""
+    return set_frontmatter(text, "scaffold_sha256",
+                           hashlib.sha256(scaffold_view(text).encode("utf-8")).hexdigest())
+
+
+def same_but_stamps(old, new, stamps):
+    """True when old is new line for line, apart from the stamps every run writes afresh: where
+    new carries one ((value, pattern) pairs: today's date, the tree hash), old may carry any
+    value of that shape."""
+    o, n = old.split("\n"), new.split("\n")
+    if len(o) != len(n):
         return False
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+    for x, y in zip(o, n):
+        if x == y:
+            continue
+        rx = re.escape(y)
+        for value, pattern in stamps:
+            if value:
+                rx = rx.replace(re.escape(value), pattern)
+        if rx == re.escape(y) or not re.fullmatch(rx, x):
+            return False
     return True
+
+
+def kept_why(old, new, legacy_ok, stamps):
+    """None when the scaffold may replace its own document `old` with `new`; otherwise why it
+    keeps it. A document carrying the scaffold's hash is replaced only while its text still
+    matches that hash. One an older scaffold wrote carries no hash: it is replaced only on a run
+    that allows it (`acp kb scaffold`, never install or intake), and only when it is exactly
+    what the scaffold writes today apart from its stamps (the date, the tree hash), so nobody
+    edited it."""
+    h = frontmatter(old).get("scaffold_sha256")
+    if h is not None:
+        return None if h == hashlib.sha256(scaffold_view(old).encode("utf-8")).hexdigest() else "edited"
+    if legacy_ok and same_but_stamps(scaffold_view(old), new, stamps):
+        return None
+    return "legacy-changed" if legacy_ok else "legacy"
+
+
+def print_kept(held):
+    """One line for each scaffold document kept that the scaffold would once have rebuilt."""
+    for rel, why in held:
+        print(f"scaffold: kept {rel}: " + {
+            "edited": "it was edited after the scaffold wrote it; delete it to regenerate",
+            "legacy": "an older scaffold wrote it; acp kb scaffold replaces it if nobody edited it, "
+                      "or delete it to regenerate",
+            "legacy-changed": "an older scaffold wrote it and it is not what the scaffold writes "
+                              "today; delete it to regenerate"}[why])
+
+
+def write_if_scaffold(path, text, force, legacy_ok, stamps):
+    """Write, sealed with its hash, unless the file on disk is someone's own writing or was
+    changed after the scaffold wrote it. A document the scaffold wrote carries its marker; one
+    without it was written by an agent or a person, and overwriting it would destroy the very
+    thing this exists to produce. None when written; otherwise why the file was kept."""
+    if os.path.isfile(path) and not force:
+        old = read(path)
+        if SCAFFOLD_MARK not in old:
+            return "own"
+        why = kept_why(old, text, legacy_ok, stamps)
+        if why:
+            return why
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(seal(text))
+    return None
 
 
 def profile_state(kb, slug, budget):
@@ -1189,6 +1393,8 @@ def profile_state(kb, slug, budget):
 def cmd_scaffold(a, root, kb):
     level = a.level if a.level in LEVELS else "lite"
     today = date.today().isoformat()
+    legacy_ok = bool(getattr(a, "legacy_rebuild", False))
+    stamps = [(today, r"\d{4}-\d{2}-\d{2}")]
     tpl = read(template_path("feature-profile.md"))
     if not tpl:
         print(f"kb scaffold: the Feature Profile template is missing "
@@ -1203,79 +1409,147 @@ def cmd_scaffold(a, root, kb):
         print(f"grow: no knowledge base at {slash(os.path.relpath(kb, root))} — nothing to grow; "
               f"`kb.py scaffold` builds one")
         return 0
-    os.makedirs(os.path.join(kb, "profiles"), exist_ok=True)
+    check_only = bool(getattr(a, "check", False))
+    if check_only and not a.grow:
+        print("kb scaffold: --check reports what --grow would do; it is used with --grow", file=sys.stderr)
+        return 2
+    if not check_only:
+        os.makedirs(os.path.join(kb, "profiles"), exist_ok=True)
     ctx = discover(root, kb, pipeline_dir)
+    stamps.append((ctx["tree"], r"[0-9a-f]{12,64}"))
     units = ctx["units"]
     budget = narrative_prompts(tpl)
 
     # --- a tree with nothing in it yet -----------------------------------------
     if not units and not a.grow:
-        write_if_scaffold(os.path.join(kb, "analysis.md"), build_empty_analysis(root, today, level), a.force)
-        write_if_scaffold(os.path.join(kb, "status-matrix.md"), build_matrix(root, today, level, [], {}), a.force)
+        held = []
+        for name, doc in (("analysis.md", build_empty_analysis(root, today, level)),
+                          ("status-matrix.md", build_matrix(root, today, level, [], {}))):
+            why = write_if_scaffold(os.path.join(kb, name), doc, a.force, legacy_ok, stamps)
+            if why and why != "own":
+                held.append((name, why))
         with open(os.path.join(kb, LEVEL_FILE), "w", encoding="utf-8") as f:
             f.write(level + "\n")
         write_index(kb, {})
+        print_kept(held)
         print("scaffold: nothing to describe yet (0 features) — the knowledge base grows as work orders close")
         return 0
 
     # --- the profiles ------------------------------------------------------------
-    written, kept, badges = [], [], {}
+    written, kept, badges, held = [], [], {}, []
+    profdir = os.path.join(kb, "profiles")
+    prof_files = sorted(f for f in os.listdir(profdir) if f.endswith(".md")) if os.path.isdir(profdir) else []
+    covers = {f[:-3]: covered_paths(os.path.join(profdir, f), root) for f in prof_files}
     for u in units:
         path = os.path.join(kb, "profiles", u["slug"] + ".md")
         exists, at_scaffold, text = profile_state(kb, u["slug"], budget)
         # --grow adds; it does not regenerate. Otherwise a profile someone has
         # written is left alone, and one still at scaffold state is refreshed.
+        if exists and not a.grow and "scaffold_prompts" in frontmatter(text) \
+                and frontmatter(text).get("status") == "orphaned":
+            # Its code is back, so the orphaned mark the scaffold wrote no longer holds; the seal does not
+            # count that line, so a kept profile stays kept.
+            text = set_frontmatter(text, "status", "SCAFFOLD")
+            with open(os.path.join(kb, "profiles", u["slug"] + ".md"), "w", encoding="utf-8") as fh:
+                fh.write(text)
         if exists and (a.grow or (not at_scaffold and not a.force)):
             kept.append(u["slug"])
             badges[u["slug"]] = badge_of(text, budget)
             continue
-        doc = build_profile(root, tpl, u["slug"], u["dir"], u["files"],
-                            ctx["endpoints"], ctx["models"], today)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(doc)
+        # A feature whose files another profile already covers is described: a stub of its own would duplicate that profile.
+        by = None if exists else describing(u["files"], root, covers)
+        if by:
+            kept.append(u["slug"])
+            badges[u["slug"]] = badge_of(read(os.path.join(profdir, by + ".md")), budget)
+            continue
+        if not check_only:
+            doc = build_profile(root, tpl, u["slug"], u["dir"], u["files"],
+                                ctx["endpoints"], ctx["models"], today)
+            # Still at scaffold state, but edited since (a section added), or written by an
+            # older scaffold: kept, and said so.
+            why = kept_why(text, doc, legacy_ok, stamps) if exists and not a.force else None
+            if why:
+                kept.append(u["slug"])
+                badges[u["slug"]] = badge_of(text, budget)
+                held.append((f"profiles/{u['slug']}.md", why))
+                continue
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(seal(doc))
         written.append(u["slug"])
         badges[u["slug"]] = "undocumented"
 
     # --- features that are gone --------------------------------------------------
+    # A profile is gone only when none of the paths it covers exists, checked, never inferred from the scaffold's own grouping.
+    # A profile that names no path at all is checked through its feature key: gone when no directory has that key.
+    # Grow (the close) reports and changes no existing profile; an explicit scaffold marks a profile it wrote orphaned, and a
+    # profile a person wrote (no scaffold_prompts) is reported and left as it is.
     live = {u["slug"] for u in units}
-    orphaned = []
-    for f in sorted(os.listdir(os.path.join(kb, "profiles"))):
-        if not f.endswith(".md"):
-            continue
+    orphaned, gone, by_key = [], [], set()
+    keys = None
+    for f in prof_files:
         slug = f[:-3]
         if slug in live:
             continue
-        path = os.path.join(kb, "profiles", f)
+        path = os.path.join(profdir, f)
         text = read(path)
         fm = frontmatter(text)
         if "feature" not in fm:
             continue          # not the scaffold's to judge
+        items = covers.get(slug, [])
+        if items:
+            missing = [shown for shown, found in items if not found]
+            if len(missing) < len(items):
+                continue      # something it covers is still there: not gone
+            shown = ", ".join(missing[:3]) + (", ..." if len(missing) > 3 else "")
+            why = f"profiles/{f} covers paths that no longer exist ({shown})"
+        else:
+            if keys is None:
+                keys = key_dirs(root, kb)
+            key = fm.get("feature", "").strip()
+            if key in keys:
+                continue      # its feature key names a directory that is there
+            why = f"profiles/{f} names no path, and no directory has its feature key `{key}`"
+            by_key.add(slug)
+        by_scaffold = "scaffold_prompts" in fm
+        if a.grow or not by_scaffold:
+            gone.append((slug, why, by_scaffold))
+            continue
         orphaned.append(slug)
         if fm.get("status") != "orphaned":
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(set_frontmatter(text, "status", "orphaned"))
 
     # --- grow: add what is new, disturb nothing else ------------------------------
+    # Exit 3 when a profile's code is gone, so a caller decides on the exit code rather than on the wording; --check
+    # reports the same and writes nothing.
     if a.grow:
         added = sorted(written)
-        if added:
+        if added and not check_only:
             rows = read_index_rows(kb)
             for p, (h, s) in cited_rows(kb, root, [f"profiles/{s_}.md" for s_ in added]).items():
                 if p in rows:
                     continue          # an existing row stays as it was bound
                 rows[p] = (h, s)
             write_index(kb, rows)
-        if added or orphaned:
-            print(f"grow: {len(added)} profiles added"
-                  f"{' (' + ', '.join(added) + ')' if added else ''}, {len(orphaned)} orphaned")
-        else:
+        for slug, why, by_scaffold in gone:
+            what = ("the scaffold wrote it: update it, or run `acp kb scaffold` to mark it orphaned" if by_scaffold
+                    else "a person wrote it: update it or retire it by hand")
+            print(f"grow: {why}; the profile was left as it is; {what}")
+        if added:
+            print(f"grow: {len(added)} profiles {'would be added' if check_only else 'added'} ({', '.join(added)})")
+        elif not gone:
             print("grow: nothing new")
-        return 0
+        return 3 if gone else 0
 
     # --- the survey, the matrix, the level, the binding ---------------------------
-    write_if_scaffold(os.path.join(kb, "analysis.md"), build_analysis(root, today, level, ctx), a.force)
-    write_if_scaffold(os.path.join(kb, "status-matrix.md"),
-                      build_matrix(root, today, level, units, badges), a.force)
+    wrote = {f"profiles/{s}.md" for s in written}
+    for name, doc in (("analysis.md", build_analysis(root, today, level, ctx)),
+                      ("status-matrix.md", build_matrix(root, today, level, units, badges))):
+        why = write_if_scaffold(os.path.join(kb, name), doc, a.force, legacy_ok, stamps)
+        if why is None:
+            wrote.add(name)
+        elif why != "own":
+            held.append((name, why))
     with open(os.path.join(kb, LEVEL_FILE), "w", encoding="utf-8") as f:
         f.write(level + "\n")
     if a.force:
@@ -1284,9 +1558,16 @@ def cmd_scaffold(a, root, kb):
     if ctx["capped"]:
         print(f"scaffold: {ctx['found']} candidate feature(s) found; capped at {FEATURE_CAP}, "
               f"the ones holding the most source files")
-    if orphaned:
-        print(f"scaffold: orphaned (the directory is gone; the profile is kept): {', '.join(orphaned)}")
-    rc = cmd_bind(a, root, kb)
+    by_path = [o for o in orphaned if o not in by_key]
+    if by_path:
+        print(f"scaffold: orphaned (none of the paths it covers exists; the profile is kept): {', '.join(by_path)}")
+    if len(by_path) < len(orphaned):
+        print(f"scaffold: orphaned (it names no path and no directory has its feature key; the profile is kept): "
+              f"{', '.join(o for o in orphaned if o in by_key)}")
+    for slug, why, _by_scaffold in gone:
+        print(f"scaffold: not marked, a person wrote it: {why}; update or retire it")
+    print_kept(held)
+    rc = cmd_bind(a, root, kb, wrote)
     # The summary goes last so a caller reading one line of output reads this one
     # rather than the binding's.
     print(f"scaffold: {len(units)} feature(s), {len(written)} profile(s) written, {len(kept)} kept, "
@@ -1296,8 +1577,14 @@ def cmd_scaffold(a, root, kb):
 
 # --- subcommands ----------------------------------------------------------------
 
-def cmd_bind(a, root, kb):
+def cmd_bind(a, root, kb, wrote=None):
+    """Bind every document's citations. The scaffold passes the documents it wrote this run
+    (`wrote`), and a source file keeps the hash it was bound at unless a document written this run
+    cites it and no other document does, the survey and the matrix aside (they cite every file): a
+    profile the scaffold kept, or a person's own document, is not marked current against code it
+    no longer describes, and a run that wrote nothing changes no row."""
     profs = profiles_of(kb, root) if os.path.isdir(kb) else {}
+    old = read_index_rows(kb) if wrote is not None else {}
     if not profs:
         print(f"kb bind: no profiles under {slash(os.path.relpath(kb, root))} — a profile is a markdown "
               f"document carrying <!-- SOURCE: path:L12 --> citations", file=sys.stderr)
@@ -1311,6 +1598,16 @@ def cmd_bind(a, root, kb):
             key = rel_to(root, os.path.realpath(found))
             entry = rows.setdefault(key, [hash_of(found), set()])
             entry[1].add(name)
+    for key, entry in list(rows.items()):
+        if wrote is None:
+            continue
+        held = [c for c in entry[1] if c not in wrote and c not in ("analysis.md", "status-matrix.md")]
+        if key in old and (held or not any(c in wrote for c in entry[1])):
+            entry[0] = old[key][0]
+        elif key not in old and held:
+            # never bound, or dropped while the code was gone: a document this run did not write is not
+            # bound at today's code by the scaffold; `kb bind` does that
+            del rows[key]
     rows = {p: (h, profs_set) for p, (h, profs_set) in rows.items()}
     bound_tree = write_index(kb, rows)
     print(f"kb bind: {len(rows)} source file(s) cited by {len(profs)} profile(s) — "
@@ -1510,9 +1807,16 @@ def main():
             p.add_argument("--pipeline-dir", default=None,
                            help=f"where the pipeline is installed, relative to the root (default {DEFAULT_PIPELINE_DIR})")
             p.add_argument("--grow", action="store_true",
-                           help="add profiles for new features and mark vanished ones orphaned; re-bind nothing")
+                           help="add profiles for features no profile covers; report profiles whose covered paths are gone "
+                                "(exit 3); change no existing profile; re-bind nothing")
+            p.add_argument("--check", action="store_true",
+                           help="with --grow: report what grow would add and which profiles' paths are gone; write nothing")
             p.add_argument("--force", action="store_true",
                            help="regenerate every scaffolded document, including profiles already written")
+            p.add_argument("--legacy-rebuild", action="store_true",
+                           help="also replace a document an older scaffold wrote (it carries no hash) when it is "
+                                "exactly what the scaffold writes today apart from its date and tree hash; acp kb scaffold "
+                                "passes this, install and intake do not")
         if name == "status":
             p.add_argument("--json", action="store_true")
             p.add_argument("--source-ext", default=None, help="comma-separated extensions to count as source")
@@ -1527,6 +1831,7 @@ def main():
     # spelled one way with paths spelled the other resolves to nothing.
     root = os.path.realpath(a.root)
     kb = os.path.realpath(a.kb) if a.kb else os.path.join(root, DEFAULT_KB)
+    set_doc_dirs(root, kb)
     return {"scaffold": cmd_scaffold, "bind": cmd_bind,
             "status": cmd_status, "impact": cmd_impact}[a.cmd](a, root, kb)
 

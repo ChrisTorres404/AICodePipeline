@@ -25,7 +25,8 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   list) for d in "$EVALS"/*/; do [ -f "$d/eval.sh" ] && printf '  %-32s %s\n' "$(basename "$d")" "$(sed -n '3p' "$d/README.md" 2>/dev/null | cut -c1-70)"; done;;
   run)
-    which="${1:-all}"; mkdir -p "$RESULTS"; ts="$(date +%Y-%m-%d--%H%M%S)"; out="$RESULTS/$ts.md"; pass=0; fail=0; skipped=0
+    which="${1:-all}"; [ "$which" = all ] || [ -f "$EVALS/$which/eval.sh" ] || { echo "eval run: no evaluation named '$which' (see: eval list)" >&2; exit 2; }
+    mkdir -p "$RESULTS"; ts="$(date +%Y-%m-%d--%H%M%S)"; out="$RESULTS/$ts.md"; pass=0; fail=0; skipped=0
     { echo "# Pipeline evaluation — $ts"; echo; echo "| Evaluation | Status | Seconds |"; echo "|---|---|---|"; } > "$out"
     for d in "$EVALS"/*/; do
       n="$(basename "$d")"; [ -f "$d/eval.sh" ] || continue
@@ -34,13 +35,21 @@ case "$cmd" in
         skipped=$((skipped+1)); printf '  %-32s SKIP (needs source-repository fixtures)\n' "$n"
         echo "| $n | SKIP | — |" >> "$out"; continue
       fi
-      tmp="$(mktemp -d)"; t0=$(date +%s)
-      if PIPELINE_ROOT="$SELF" EVAL_TMP="$tmp" bash "$d/eval.sh" > "$tmp/log" 2>&1; then st="PASS"; pass=$((pass+1)); else st="FAIL"; fail=$((fail+1)); fi
+      tmpbase="${TMPDIR:-/tmp}"; tmp="$(mktemp -d "${tmpbase%/}/acp-eval.XXXXXX")"; t0=$(date +%s)   # under TMPDIR on macOS too
+      # Each evaluation gets its own HOME, XDG_CONFIG_HOME, git configuration (a test identity, and no
+      # system file) and TMPDIR inside its scratch folder, so none reads or writes the person's own.
+      mkdir -p "$tmp/home/.config" "$tmp/tmp"; printf '[user]\n\tname = ACP Eval\n\temail = eval@example.com\n' > "$tmp/home/.gitconfig"
+      unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME GIT_TEMPLATE_DIR GIT_TRACE GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF GIT_TRACE_PACKET GIT_TRACE_PERFORMANCE GIT_TRACE_SETUP
+      if HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/home/.config" GIT_CONFIG_GLOBAL="$tmp/home/.gitconfig" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM="$tmp/home/.gitconfig-system" TMPDIR="$tmp/tmp" \
+          PIPELINE_ROOT="$SELF" EVAL_TMP="$tmp" bash "$d/eval.sh" > "$tmp/log" 2>&1; then st="PASS"; pass=$((pass+1)); else st="FAIL"; fail=$((fail+1)); fi
       t=$(( $(date +%s) - t0 )); printf '  %-32s %s (%ss)\n' "$n" "$st" "$t"; echo "| $n | $st | $t |" >> "$out"
       [ "$st" = FAIL ] && { echo; echo "### $n"; echo '```'; tail -40 "$tmp/log"; echo '```'; } >> "$out"
       rm -rf "$tmp"
     done
-    [ "$which" = all ] || [ -f "$EVALS/$which/eval.sh" ] || { echo "eval run: no evaluation named '$which' (see: eval list)" >&2; exit 2; }
+    # A named run that matched no folder ran nothing: `x/`, `./x` or `../evals/x` pass the name check
+    # above but never equal a folder name, and a dot folder is never visited. Refuse, keeping no record.
+    [ "$which" = all ] || [ $((pass + fail + skipped)) -gt 0 ] || { rm -f "$out"; echo "eval run: '$which' matched no evaluation folder, so nothing ran" >&2; exit 2; }
+    echo "eval-summary: passed=$pass failed=$fail skipped=$skipped"
     echo; if [ "$skipped" -gt 0 ]; then echo "  $pass passed, $fail failed, $skipped skipped — $out"
       echo "  ($skipped evaluations need fixtures only the pipeline repository carries, so coverage here is narrower than the source suite.)"
     else echo "  $pass passed, $fail failed — $out"; fi
@@ -53,7 +62,7 @@ case "$cmd" in
     for d in "$EVALS"/live/*/; do
       n="$(basename "$d")"; case "$n" in _*) continue;; esac; [ -f "$d/prompt.md" ] || continue
       [ "$which" = all ] || [ "$which" = "$n" ] || continue
-      tmp="$(mktemp -d)"; proj="$tmp/project"; t0=$(date +%s)
+      tmpbase="${TMPDIR:-/tmp}"; tmp="$(mktemp -d "${tmpbase%/}/acp-live.XXXXXX")"; proj="$tmp/project"; t0=$(date +%s)   # under TMPDIR on macOS too
       "$SELF/bin/new-project" "$proj" --name "Live Fixture" >/dev/null 2>&1 || { echo "  $n  FAIL (scaffold)"; fail=$((fail+1)); continue; }
       cp -R "$EVALS/live/_fixture/." "$proj/"; ( cd "$proj" && git add -A >/dev/null && git -c user.email=e@x -c user.name=e commit -q -m "fixture" )
       [ -f "$d/setup.sh" ] && PROJECT="$proj" bash "$d/setup.sh"

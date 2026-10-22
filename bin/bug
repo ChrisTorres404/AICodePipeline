@@ -46,9 +46,37 @@ else
   PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
   BUG_DIR="$PROJECT_ROOT/${BUGS_DIR:-Workspace/Docs/Bugs}"
 fi
+# The product's code, relative to PROJECT_ROOT like every *_DIR; "." is the whole project, as before CODE_DIR
+# existed. It reaches git pathspecs and find, so it is checked as data before any use: the raw value before it
+# is normalised (so "/" cannot become "."), the normalised one after.
+CODE_DIR="${CODE_DIR:-.}"; code_dir_raw="$CODE_DIR"
+case "$CODE_DIR" in /*|-*|:*|*[*?[\\]*|*$'\n'*|*$'\r'*) CODE_DIR="";; esac
+if [ -n "$CODE_DIR" ]; then
+  CODE_DIR="${CODE_DIR#./}"; while [ "${CODE_DIR%/}" != "$CODE_DIR" ]; do CODE_DIR="${CODE_DIR%/}"; done; [ -n "$CODE_DIR" ] || CODE_DIR=.
+  case "$CODE_DIR" in ..|../*|*/..|*/../*|*//*|*/./*|*/.|./*) CODE_DIR="";; esac
+fi
+[ -n "$CODE_DIR" ] || { printf '%s: CODE_DIR in pipeline.config.sh or the environment must be a folder inside the project, written relative to it (got: %q)\n' "bug" "$code_dir_raw" >&2; exit 1; }
 
 die() { echo "bug: $*" >&2; exit 1; }
-slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//'; }
+slugify() { # a title with no letter or digit a folder name can hold (all of it in another script) is "untitled"
+  local s; s="$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//')"; echo "${s:-untitled}"
+}
+make_artifacts() { # bug folder -> its artifacts/, for working files; a link or a file there is left for doctor and promote to name
+  [ -L "$1/artifacts" ] && return 0; [ ! -e "$1/artifacts" ] || [ -d "$1/artifacts" ] || return 0
+  mkdir -p "$1/artifacts"
+}
+order_ignore() { # [--dry-run] -> the bug folder's own .gitignore keeps every bug's artifacts/ out of git; refused, nothing goes on
+  python3 "$(dirname "$CHECK")/order-ignore.py" "$BUG_DIR" "$@" || die "refusing: the .gitignore that keeps bug working files out of git could not be kept (above); nothing was written"
+}
+order_report() { # bug folder -> what the structure rule will name in it, as it stands on disk
+  local lp; lp="$(dirname "$CHECK")/layout.py"; [ -f "$lp" ] || return 0
+  python3 "$lp" --order "$1" 2>/dev/null || true
+}
+say_kept() { # report lines -> said, before a bug folder is adopted as it is
+  [ -n "$1" ] || return 0
+  echo "kept as they are, and acp doctor will name them (move each into the bug's artifacts/, or delete it):"
+  printf '%s\n' "$1" | sed 's/^structure /    /'
+}
 bug_folder() { # number -> path, or empty. Two folders sharing a number is not a
   # thing to resolve by picking one: whichever is chosen, the other record becomes
   # unaddressable and every later command silently acts on the wrong bug.
@@ -75,9 +103,13 @@ with_id_lock() { # <command...> — serialise identity allocation across process
     [ "$waited" -gt 600 ] && die "another bug is holding the identity lock ($lock). Remove it if nothing else is running."
     sleep 0.1 2>/dev/null || sleep 1
   done
-  trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+  # The caller may hold its own EXIT trap: keep it running at exit with the script's exit status in $?, and put it back afterwards.
+  local prev_trap prev_cmd="" lock_q; prev_trap="$(trap -p EXIT)"
+  if [ -n "$prev_trap" ]; then prev_cmd="$(eval "set -- $prev_trap"; printf '%q' "$3")"; else prev_cmd="''"; fi
+  lock_q="$(printf '%q' "$lock")"
+  trap '_acp_rc=$?; rm -rf '"$lock_q"' 2>/dev/null || true; if [ "$_acp_rc" -eq 0 ]; then eval '"$prev_cmd"'; else (exit "$_acp_rc") || eval '"$prev_cmd"'; fi' EXIT
   "$@" || rc=$?
-  trap - EXIT
+  if [ -n "$prev_trap" ]; then eval "$prev_trap"; else trap - EXIT; fi
   rm -rf "$lock" 2>/dev/null || true
   return $rc
 }
@@ -104,7 +136,14 @@ next_number() {
   printf '%04d' "$cand"
 }
 
-render() { sed -e "s/BUG-XXXX/BUG-$3/g" -e "s/\[Title\]/$4/g" -e "s/\[Short Title\]/$4/g" -e "s/YYYY-MM-DD/$(date +%F)/g" "$1" > "$2"; }
+render() { # template dest number title; the values go in as data, in one pass, inserted literally by perl (register E2, E25)
+  # perl only warns "Can't open" and exits 0 on a missing template: refused before anything is written
+  [ -f "$1" ] && [ -r "$1" ] || die "template missing or unreadable: $1"
+  ACP_R_NUM="$3" ACP_R_TITLE="$4" ACP_R_DATE="$(date +%F)" perl -C0 -pe '
+    BEGIN { %v = ("BUG-XXXX" => "BUG-$ENV{ACP_R_NUM}", "[Title]" => $ENV{ACP_R_TITLE}, "[Short Title]" => $ENV{ACP_R_TITLE}, "YYYY-MM-DD" => $ENV{ACP_R_DATE}) }
+    s/(BUG-XXXX|\[Title\]|\[Short Title\]|YYYY-MM-DD)/$v{$1}/g;
+  ' "$1" > "$2"
+}
 
 route() { # category -> "series|investigate|fix|validate"
   case "$1" in
@@ -133,7 +172,13 @@ cmd_new() {
       *)  title="$1"; shift;;
     esac
   done
+  # A title is one line of text, short enough for a folder name: a trailing carriage return is
+  # dropped, any other control character (a newline, a tab) is refused.
+  title="${title%$'\r'}"
+  case "$title" in *[[:cntrl:]]*) die "bug new: the title holds a newline, tab or other control character; give it on one line";; esac
+  [ "$(printf '%s' "$title" | LC_ALL=C wc -c | tr -d ' ')" -le 200 ] || die "bug new: the title is longer than 200 bytes; the most is 200, since it names the folder"
   [ -n "$title" ] || die 'usage: bug new "<title>" [--category C] [--series N] [--prompt]'
+  case "$series" in "") ;; *[!0-9]*|?????*) die "bug new: --series must be 1 to 4 digits";; esac   # before any arithmetic
   local routing="" investigate="" fix="" validate=""
   if [ -n "$category" ]; then
     routing="$(route "$category")" || die "unknown category '$category' — auth api database ui observability security performance integration config docs"
@@ -147,12 +192,12 @@ cmd_new() {
       [ -n "$ui" ] && { fix="${fix//"$toku"/$ui}"; investigate="${investigate//react-expert/$ui}"; }
     fi
   fi
-  mkdir -p "$BUG_DIR"
+  mkdir -p "$BUG_DIR"; order_ignore
   [ -n "$series" ] || series="1000"   # uncategorised bugs go to the overflow series, as the methodology says
   local num slug dir
   # Choosing a number and taking it have to be one operation; see bin/wo.
   reserve_number() {
-    num="$(next_number "$series")"; slug="$(slugify "$title")"
+    num="$(next_number "$series")" || exit 1; slug="$(slugify "$title")"   # a full band refuses; nothing is made
     dir="$BUG_DIR/BUG-$num-$slug"
     [ -e "$dir" ] && die "$dir already exists"
     [ -n "$(find "$BUG_DIR" -maxdepth 1 -type d -name "BUG-$num-*" -print -quit 2>/dev/null)" ] \
@@ -160,10 +205,14 @@ cmd_new() {
     mkdir -p "$dir"
   }
   with_id_lock reserve_number
+  # Until it is whole, a failure removes the folder just reserved, so no half-made folder holds the number.
+  _acp_half="$dir"; trap '_acp_rc=$?; [ -z "${_acp_half:-}" ] || rm -rf "$_acp_half"; exit "$_acp_rc"' EXIT
   write_manifest "$dir/.bug-manifest"
+  make_artifacts "$dir" || die "bug new: could not make $dir/artifacts"
   render "$TEMPLATES/BUG-TEMPLATE-ISSUE.md" "$dir/BUG-$num-$slug.md" "$num" "$title"
   [ "$want_prompt" -eq 1 ] && render "$TEMPLATES/BUG-TEMPLATE-PROMPT.md" "$dir/BUG-$num-Prompt.md" "$num" "$title"
-  printf 'title=%s\ncategory=%s\ncreated=%s\nowner=%s\n' "$title" "${category:-}" "$(date +%F)" "$(git config user.name 2>/dev/null || whoami)" > "$dir/.bug-meta"
+  local owner; owner="$(git config user.name 2>/dev/null || whoami)"; owner="$(printf '%s' "$owner" | LC_ALL=C tr -d '\000-\037\177')"   # one line, whatever git holds
+  printf 'title=%s\ncategory=%s\ncreated=%s\nowner=%s\n' "$title" "${category:-}" "$(date +%F)" "$owner" > "$dir/.bug-meta"
   if [ -n "$category" ]; then
     printf 'category=%s\ninvestigate=%s\nfix=%s\nvalidate=%s\n' "$category" "$investigate" "$fix" "$validate" >> "$dir/.bug-meta"
     # the routing goes at the top of the issue document so whoever opens it sees it first
@@ -175,6 +224,7 @@ lines = s.split("\n", 1)
 p.write_text(lines[0] + "\n" + block + ("\n" + lines[1] if len(lines) > 1 else ""))
 PYEOF
   fi
+  _acp_half=""; trap - EXIT   # whole: the folder stays
   echo "BUG-$num opened: $dir"
   ls "$dir" | sed 's/^/    /'
   if [ -n "$category" ]; then
@@ -211,14 +261,53 @@ cmd_adopt() { # <file> --number N --category C [--title T] [--status migrated] [
   done
   [ -n "$file" ] && [ -f "$file" ] || die 'usage: bug adopt <file.md> --number N --category C [--title T] [--status migrated|open|fixed] [--dry-run]'
   [ -n "$num" ] || die "bug adopt: --number is required; adopted bugs keep the number their record cites"
+  case "$num" in ""|*[!0-9]*|?????*) die "bug adopt: --number must be digits (1 to 4 digits)";; esac
   [ -n "$cat" ] || die "bug adopt: --category is required, because the number cannot say what the bug is about"
+  # every value written into .bug-meta is one line and an allowed value
+  case "$cat" in other) ;; *) route "$cat" >/dev/null 2>&1 || die "bug adopt: unknown category '$cat' — auth api database ui observability security performance integration config docs other";; esac   # intake's inventory uses other
+  case "$status" in migrated|open|fixed) ;; *) die "bug adopt: --status must be migrated, open or fixed";; esac
+  case "$file" in *[[:cntrl:]]*) die "bug adopt: the record's path holds a newline, tab or other control character";; esac
+  local owner; owner="$(git config user.name 2>/dev/null || whoami)"; owner="$(printf '%s' "$owner" | LC_ALL=C tr -d '\000-\037\177')"   # one line, whatever git holds
   num="$(printf '%04d' "$((10#$num))")"
-  [ -z "$title" ] && title="$(grep -m1 -E '^# ' "$file" | sed 's/^# *//' | cut -c1-80)"; [ -z "$title" ] && title="$(basename "$file" .md)"
+  if [ -z "$title" ]; then
+    # the record's own heading: its first 80 characters, then whole characters dropped until it fits 200 bytes. GNU cut -c
+    # counts bytes and ${x%?} follows the locale, so neither keeps a character boundary everywhere; this does
+    title="$(grep -m1 -E '^# ' "$file" | sed 's/^# *//' | python3 -I -c 'import sys
+t = sys.stdin.buffer.read().split(b"\n")[0].decode("utf-8", "surrogateescape")[:80]
+while len(t.encode("utf-8", "surrogateescape")) > 200: t = t[:-1]
+sys.stdout.buffer.write(t.encode("utf-8", "surrogateescape"))')"
+  fi
+  [ -z "$title" ] && title="$(basename "$file" .md)"
+  # A title is one line of text, short enough for a folder name: a trailing carriage return is
+  # dropped, any other control character (a newline, a tab) is refused.
+  title="${title%$'\r'}"
+  [ -z "$title" ] && title="$(basename "$file" .md)"
+  case "$title" in *[[:cntrl:]]*) die "bug adopt: the title holds a newline, tab or other control character; give it on one line";; esac
+  [ "$(printf '%s' "$title" | LC_ALL=C wc -c | tr -d ' ')" -le 200 ] || die "bug adopt: the title is longer than 200 bytes; the most is 200, since it names the folder"
   local fdir; fdir="$(cd "$(dirname "$file")" && pwd -P)"
   case "$fdir" in "$BUG_DIR"/BUG-"$num"-*)
     [ -f "$fdir/.bug-meta" ] && die "BUG-$num is already the pipeline's (it carries .bug-meta)"
-    if [ "$dry" -eq 1 ]; then printf 'would adopt in place  %s\n           category  %s   status %s\n' "${fdir#$PROJECT_ROOT/}" "$cat" "$status"; return 0; fi
-    printf 'title=%s\ncategory=%s\ncreated=%s\nadopted=%s\nadopted_from=%s\nowner=%s\nstatus=%s\n' "$title" "$cat" "$(date +%F)" "$(date +%F)" "$file" "$(git config user.name 2>/dev/null || whoami)" "$status" > "$fdir/.bug-meta"
+    # The record is filed under the bug's document name, unless it already is one of the bug's own;
+    # everything else in the folder is kept as it is, and said.
+    local rep rec="${file##*/}" fb="${fdir##*/}" target=""; rep="$(order_report "$fdir")"
+    case "$rep" in *"structure $fb/$rec: "*)
+      target="BUG-$num-$(slugify "$title").md"
+      { [ ! -e "$fdir/$target" ] && [ ! -L "$fdir/$target" ]; } || die "refusing to adopt BUG-$num in place: $rec would be filed as $target, which is taken; nothing was written";;
+    esac
+    rep="$(printf '%s\n' "$rep" | { grep -vF "structure $fb/$rec: " || true; })"
+    if [ "$dry" -eq 1 ]; then
+      printf 'would adopt in place  %s\n           category  %s   status %s\n' "${fdir#$PROJECT_ROOT/}" "$cat" "$status"
+      [ -z "$target" ] || printf '        would file  %s as %s\n' "$rec" "$target"
+      order_ignore --dry-run; say_kept "$rep"; return 0
+    fi
+    order_ignore; say_kept "$rep"
+    if [ -n "$target" ]; then   # git mv when git tracks it, so its history follows
+      if git -C "$fdir" ls-files --error-unmatch -- "$rec" >/dev/null 2>&1; then git -C "$fdir" mv -- "$rec" "$target" || die "bug adopt: git could not file $rec as $target"
+      else mv -- "$fdir/$rec" "$fdir/$target" || die "bug adopt: could not file $rec as $target"; fi
+      echo "filed $rec as $target"
+    fi
+    printf 'title=%s\ncategory=%s\ncreated=%s\nadopted=%s\nadopted_from=%s\nowner=%s\nstatus=%s\n' "$title" "$cat" "$(date +%F)" "$(date +%F)" "$file" "$owner" "$status" > "$fdir/.bug-meta"
+    make_artifacts "$fdir" || die "bug adopt: could not make $fdir/artifacts"
     echo "BUG-$num adopted in place ($status, $cat): ${fdir#$PROJECT_ROOT/}"; return 0;;
   esac
   local taken; taken="$(find "$BUG_DIR" -maxdepth 1 -type d -name "BUG-$num-*" -print -quit 2>/dev/null)"
@@ -231,11 +320,15 @@ cmd_adopt() { # <file> --number N --category C [--title T] [--status migrated] [
   fi
   local slug; slug="$(slugify "$title")"; local dir="$BUG_DIR/BUG-$num-$slug"
   if [ "$dry" -eq 1 ]; then printf 'would adopt  %s\n         as  %s/BUG-%s-%s.md\n   category  %s   status %s%s\n' "$file" "${dir#$PROJECT_ROOT/}" "$num" "$slug" "$cat" "$status" "${note:+   ($note)}"; return 0; fi
-  mkdir -p "$BUG_DIR"
+  mkdir -p "$BUG_DIR"; order_ignore
   reserve_number() { [ -e "$dir" ] && die "$dir already exists"; mkdir -p "$dir"; }
   with_id_lock reserve_number
+  # Until it is whole, a failure removes the folder just reserved, so no half-made folder holds the number.
+  _acp_half="$dir"; trap '_acp_rc=$?; [ -z "${_acp_half:-}" ] || rm -rf "$_acp_half"; exit "$_acp_rc"' EXIT
   cp "$file" "$dir/BUG-$num-$slug.md"
-  printf 'title=%s\ncategory=%s\ncreated=%s\nadopted=%s\nadopted_from=%s\nowner=%s\nstatus=%s\n' "$title" "$cat" "$(date +%F)" "$(date +%F)" "$file" "$(git config user.name 2>/dev/null || whoami)" "$status" > "$dir/.bug-meta"
+  printf 'title=%s\ncategory=%s\ncreated=%s\nadopted=%s\nadopted_from=%s\nowner=%s\nstatus=%s\n' "$title" "$cat" "$(date +%F)" "$(date +%F)" "$file" "$owner" "$status" > "$dir/.bug-meta"
+  make_artifacts "$dir" || die "bug adopt: could not make $dir/artifacts"
+  _acp_half=""; trap - EXIT   # whole: the folder stays
   echo "BUG-$num adopted ($status, $cat): ${dir#$PROJECT_ROOT/}"
   [ -n "$note" ] && echo "  note: $note"
   echo "No verification was written; adopted bugs are recorded, not verified."
@@ -262,7 +355,13 @@ cmd_status() {
   done
 }
 
-render_v() { sed -e "s/BUG-XXXX/BUG-$3/g; s/WO-XXXX/BUG-$3/g" -e "s/\[Title\]/$4/g" -e "s/YYYY-MM-DD/$(date +%F)/g" "$1" > "$2"; }
+render_v() { # template dest number title, for the verification document; values inserted literally, in one pass, as in render
+  [ -f "$1" ] && [ -r "$1" ] || die "template missing or unreadable: $1"   # as in render
+  ACP_R_NUM="$3" ACP_R_TITLE="$4" ACP_R_DATE="$(date +%F)" perl -C0 -pe '
+    BEGIN { %v = ("BUG-XXXX" => "BUG-$ENV{ACP_R_NUM}", "WO-XXXX" => "BUG-$ENV{ACP_R_NUM}", "[Title]" => $ENV{ACP_R_TITLE}, "YYYY-MM-DD" => $ENV{ACP_R_DATE}) }
+    s/(BUG-XXXX|WO-XXXX|\[Title\]|YYYY-MM-DD)/$v{$1}/g;
+  ' "$1" > "$2"
+}
 vtemplate() { # the bug verification template when the templates ship one; the shared one otherwise
   if [ -f "$TEMPLATES/BUG-TEMPLATE-VERIFICATION.md" ]; then echo "$TEMPLATES/BUG-TEMPLATE-VERIFICATION.md"; else echo "$TESTING_TEMPLATES/TEST-TEMPLATE-VERIFICATION.md"; fi
 }
@@ -290,15 +389,26 @@ cmd_verify() {
     echo "BUG-$n verification document created: $out"
   fi
   [ -z "$suite" ] && { echo "Status is NOT EXECUTED — PLAN ONLY until you run something:  bug verify $n --run <suite.sh>"; return 0; }
+  # A newline or carriage return in the path would split the status line and could forge a second one.
+  case "$suite" in *$'\n'*|*$'\r'*) die "suite path holds a newline or carriage return; rename the suite";; esac
   [ -f "$suite" ] || die "suite not found: $suite"
+  code_dir_check
   local stamp log rc status; stamp="$(date +%Y%m%d-%H%M%S)-$$"; log="$d/BUG-$n-VERIFICATION-$stamp.log"
   # Mark the run before it starts, so an interrupted run cannot leave an older
   # PASS standing as the authoritative answer. See bin/wo for the reasoning.
-  local fp_before fp_after drift=""
-  fp_before="$(tree_fingerprint)"
-  perl -pi -e "s|^\*\*Overall status:\*\* .*|**Overall status:** RUNNING (run $stamp started, tree $fp_before)|" "$out"
+  local fp_before fp_after commit drift=""
+  fp_before="$(tree_fingerprint)"; commit="$(source_commit)"
+  [ "$fp_before" != nofp ] || die "cannot fingerprint the source (the line above says why); nothing was run or recorded"
+  ACP_V_LINE="**Overall status:** RUNNING (run $stamp started, tree $fp_before)" perl -C0 -pi -e 's/^\*\*Overall status:\*\* .*/$ENV{ACP_V_LINE}/' "$out"
   set +e; bash "$suite" >"$log" 2>&1; rc=$?; set -e
   fp_after="$(tree_fingerprint)"
+  # Keep evidence portable and shareable: no host paths in the log, the record or the issue comment.
+  # The project's path goes first (a path under it becomes relative, the project itself "."), then the
+  # home folder becomes "~"; wherever it starts (a file:// URL, a -I flag, colour codes) but only where it
+  # ends, so <root>x is kept; a home that is empty or "/" is left alone.
+  ACP_V_ROOT="$PROJECT_ROOT" ACP_V_HOME="${HOME:-}" perl -C0 -pi -e 'BEGIN { $r=$ENV{ACP_V_ROOT}; $h=$ENV{ACP_V_HOME}; $h=~s#/+\z##; $p=q#[^\s"\x27`=:;,|()<>\[\]{}]# } if (length $r) { s#\Q$r\E/##g; s#\Q$r\E(?!$p)#.#g } s#\Q$h\E(?=/|(?!$p))#~#g if length $h' "$log" 2>/dev/null || true
+  local shown="${suite#"$PROJECT_ROOT"/}" hm="${HOME:-}"; hm="${hm%/}"   # the prefix quoted: a literal, not a pattern
+  case "$hm" in "") ;; *) case "$shown" in "$hm"/*) shown="~/${shown#"$hm"/}";; esac;; esac
   if [ "$rc" -eq 0 ]; then status="EXECUTED — PASS"
   elif [ "$rc" -eq 77 ]; then status="NOT EXECUTED — PRECONDITION FAILED"
   else status="EXECUTED — FAIL"; fi
@@ -312,13 +422,15 @@ cmd_verify() {
       drift="Source changed while the suite ran (tree $fp_before at start, $fp_after at end). The suite may never have read what is on disk now. Re-run on a still tree, or ALLOW_TREE_DRIFT=1 if the suite writes into the tree by design."
     fi
   fi
-  { printf '\n### Run %s\n\n- **Status:** %s\n- **Command:** `bash %s`\n- **Exit code:** %s\n- **Log:** `%s`\n' "$stamp" "$status" "$suite" "$rc" "$(basename "$log")"
+  { printf '\n### Run %s\n\n- **Status:** %s\n- **Command:** `bash %s`\n- **Exit code:** %s\n- **Log:** `%s`\n' "$stamp" "$status" "$shown" "$rc" "$(basename "$log")"
+    printf -- '- **Commit:** %s\n' "$commit"
     [ -n "$checks" ] && printf -- '- **Checks:** %s\n' "$checks"
-    printf -- '- **Suite:** `%s` (%s)\n' "${suite#$PROJECT_ROOT/}" "$shash"
+    printf -- '- **Suite:** `%s` (%s)\n' "$shown" "$shash"
     [ -n "$drift" ] && printf -- '- **Source state:** %s\n' "$drift"
     printf '\n```\n'; tail -60 "$log"; printf '```\n'; } >> "$out"
-  local ratio=""; [ -n "$counts" ] && ratio=", checks ${counts% *}/$(( ${counts% *} + ${counts#* } ))"
-  perl -pi -e "s|^\*\*Overall status:\*\* .*|**Overall status:** $status (last run $stamp, tree $fp_after, suite ${suite#$PROJECT_ROOT/}\@$shash$ratio)|" "$out"
+  local ratio=""; [ -n "$counts" ] && ratio=", checks ${counts% *}/$(( 10#${counts% *} + 10#${counts#* } ))"   # decimal: a suite may print 08
+  # The suite path and the other values go in as data (register D-2): a path holding | $ @ or perl code is written as typed.
+  ACP_V_LINE="**Overall status:** $status (last run $stamp, tree $fp_after, suite $shown@$shash$ratio)" perl -C0 -pi -e 's/^\*\*Overall status:\*\* .*/$ENV{ACP_V_LINE}/' "$out"
   echo "$status (exit $rc) — recorded in $(basename "$out")"
   [ "$rc" -eq 0 ] || return 1
 }
@@ -333,7 +445,7 @@ placeholder_budget() { # how many template prompts may still remain at close
   if [ -f "$t" ]; then base="$(unfilled_placeholders "$t")"; echo "$((base / 2))"; else echo 24; fi
 }
 
-CHECK="$PIPELINE_ROOT/core/hooks/check.py"
+CHECK="$PIPELINE_ROOT/core/hooks/check.py"; [ -f "$CHECK" ] || [ ! -d "$PIPELINE_ROOT/hooks/scripts" ] || CHECK="$PIPELINE_ROOT/hooks/scripts/check.py"   # plugin layout
 fingerprint_excludes() {
   printf '%s\n' "${WORKORDERS_DIR:-Workspace/Docs/WorkOrders}" "${BUGS_DIR:-Workspace/Docs/Bugs}" "${SESSIONS_DIR:-Workspace/Sessions}" "${PIPELINE_ROOT#$PROJECT_ROOT/}" "${TESTING_DIR:-Workspace/Testing}/results" "${TESTING_DIR:-Workspace/Testing}/suites" "${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}"
 }
@@ -341,42 +453,133 @@ write_manifest() { # <file>
   [ -f "$CHECK" ] || return 0
   ( cd "$PROJECT_ROOT" && python3 "$CHECK" --root "$PROJECT_ROOT" --write-manifest "$1" --exclude $(fingerprint_excludes | tr '\n' ' ') ) 2>/dev/null || true
 }
+fp_pathspecs() { # sets the caller's ex and scope: "the source" as git pathspecs relative to PROJECT_ROOT
+  local tdir="${TESTING_DIR:-Workspace/Testing}"
+  ex=(":!${WORKORDERS_DIR:-Workspace/Docs/WorkOrders}" ":!${BUGS_DIR:-Workspace/Docs/Bugs}" ":!${SESSIONS_DIR:-Workspace/Sessions}" ":!${PIPELINE_ROOT#$PROJECT_ROOT/}" ":!$tdir/results" ":!$tdir/suites" ":!${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}")
+  # The source is CODE_DIR; WO_PATHS narrows it to what the work order declared (wo new --paths)
+  scope=(.); [ "$CODE_DIR" = . ] || scope=("./$CODE_DIR")
+  [ -n "${WO_PATHS:-}" ] && IFS=, read -r -a scope <<< "$WO_PATHS"
+  return 0
+}
+fp_files() { # the files that are "the source", each path ended by a NUL, sorted by byte; run it inside PROJECT_ROOT
+  # A NUL is the one byte no file name holds: a newline, tab, quote, backslash or control character in a
+  # name would otherwise split the path, or make git quote it so it named no file, and leave it out.
+  local tdir="${TESTING_DIR:-Workspace/Testing}" ex scope; fp_pathspecs
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    { git ls-files -z -- "${scope[@]}" "${ex[@]}"
+      git ls-files -z -o --exclude-standard -- "${scope[@]}" "${ex[@]}"; } 2>/dev/null \
+      | LC_ALL=C sort -z -u | while IFS= read -r -d '' f; do [ -f "$f" ] && printf '%s\0' "$f"; done
+  else
+    find "${scope[@]}" -type f -not -path './.git/*' -not -path "./${WORKORDERS_DIR:-Workspace/Docs/WorkOrders}/*" -not -path "./${BUGS_DIR:-Workspace/Docs/Bugs}/*" -not -path "./${SESSIONS_DIR:-Workspace/Sessions}/*" \
+         -not -path "./${PIPELINE_ROOT#$PROJECT_ROOT/}/*" -not -path "./$tdir/results/*" -not -path "./$tdir/suites/*" -not -path "./${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}/*" -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path '*/dist/*' -print0 2>/dev/null \
+      | LC_ALL=C sort -z
+  fi
+}
+fp_name() { # sets FP_NAME: the path as one line, as it is, or, when it holds a newline or a backslash, a backslash
+  # then the path with each backslash doubled and each newline written \n (no plain name starts with a backslash)
+  case "$1" in *$'\n'*|*\\*) FP_NAME="${1//\\/\\\\}"; FP_NAME="\\${FP_NAME//$'\n'/\\n}";; *) FP_NAME="$1";; esac
+}
 # Shared with bin/wo: the same evidence rule has to mean the same thing in both.
+fp_why() { # <status>: say in one line what kept the source from being fingerprinted ($t/why holds a kind and a name)
+  local n; n="$(tail -c +2 "$t/why" 2>/dev/null; printf x)"; n="${n%x}"
+  if [ "$1" -eq 3 ] && [ -s "$t/why" ]; then
+    case "$(head -c 1 "$t/why")" in
+      r) n="cannot read $(printf '%q' "$n")";;
+      g) n="$(printf '%q' "$n") is gone (it went while the source was being read)";;
+      *) n="git could not hash $(printf '%q' "$n")";;
+    esac
+  elif [ -s "$t/err" ]; then n="perl stopped: $(head -1 "$t/err")"
+  else n="git could not hash the source"; fi
+  printf '%s: %s, so the source cannot be fingerprinted\n' "${0##*/}" "$n" >&2
+}
 tree_fingerprint() { # hash of the source state the evidence was produced against; the work-order, bug, session, results, suites, and pipeline folders are excluded
-  ( set +e; cd "$PROJECT_ROOT" 2>/dev/null || { echo nofp; exit 0; }
-    local tdir="${TESTING_DIR:-Workspace/Testing}"
-    local ex=(":!${WORKORDERS_DIR:-Workspace/Docs/WorkOrders}" ":!${BUGS_DIR:-Workspace/Docs/Bugs}" ":!${SESSIONS_DIR:-Workspace/Sessions}" ":!${PIPELINE_ROOT#$PROJECT_ROOT/}" ":!$tdir/results" ":!$tdir/suites" ":!${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}")
-    # WO_PATHS narrows "the source" to what the work order declared (wo new --paths)
-    local scope=(.); [ -n "${WO_PATHS:-}" ] && IFS=, read -r -a scope <<< "$WO_PATHS"
+  ( set +e; set -o pipefail; cd "$PROJECT_ROOT" 2>/dev/null || { echo nofp; exit 0; }
+    # Scratch files hold names and hashes only, never the source's content, in one folder under TMPDIR that goes
+    # with this process, Ctrl-C included. Every refusal says in one line why.
+    tmpbase="${TMPDIR:-/tmp}"; t="$(mktemp -d "${tmpbase%/}/acp-fp.XXXXXX")" \
+      || { printf '%s: no scratch folder could be made under %s, so the source cannot be fingerprinted\n' "${0##*/}" "${tmpbase%/}" >&2; echo nofp; exit 0; }
+    trap 'rm -rf "$t"' EXIT; trap 'exit 1' INT TERM HUP
+    fp_files > "$t/list"
     if git rev-parse --show-toplevel >/dev/null 2>&1; then
       # Every file contributes the same way whether git tracks it yet or not: its
       # path and a hash of its content. Hashing index entries for tracked files and
       # raw bytes for untracked ones meant `git add` changed the fingerprint of a
       # file whose content had not changed, so committing the work staled the
       # evidence just produced. One hash-object process reads every path at once.
-      local list; list="$(mktemp)"
-      { git -c core.quotePath=false ls-files -- "${scope[@]}" "${ex[@]}"
-        git -c core.quotePath=false ls-files -o --exclude-standard -- "${scope[@]}" "${ex[@]}"; } 2>/dev/null \
-        | LC_ALL=C sort -u | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done > "$list"
-      paste -d' ' <(git hash-object --stdin-paths < "$list" 2>/dev/null) "$list"
-      rm -f "$list"
+      # git reads --stdin-paths from the repository's top folder, so each path is given whole ($PWD/...): from a
+      # project in a subfolder of its repository a relative path named nothing and only the names were hashed.
+      # A name hash-object cannot read from a line (a newline or carriage return in it, which it splits or strips,
+      # or a leading quote it would unquote) is hashed on its own. A file that cannot be read (by its permissions
+      # or an ACL), or that git cannot hash, makes the fingerprint nofp: never a value that hid it. Each pass over
+      # the list is one perl process, not a shell loop: on a large tree the loop cost more than the hashing.
+      local ok=1 rc
+      case "$PWD" in *$'\n'*|*$'\r'*) ok=""; printf '%s: the project'"'"'s path holds a newline or carriage return, so the source cannot be fingerprinted\n' "${0##*/}" >&2;; esac
+      if [ -n "$ok" ]; then
+        FP_WHY="$t/why" perl -C0 -0 -ne 'use filetest "access"; chomp;
+            unless (-r $_) { open(my $W, ">", $ENV{FP_WHY}); print $W ((-e $_ || -l $_) ? "r" : "g"), $_; exit 3 }
+            print "$ENV{PWD}/$_\n" unless /[\n\r]/ || /^"/' < "$t/list" > "$t/plain" 2> "$t/err"; rc=$?
+        [ "$rc" -eq 0 ] || { fp_why "$rc"; ok=""; }
+      fi
+      if [ -n "$ok" ]; then
+        { git hash-object --stdin-paths < "$t/plain" > "$t/hashes" 2>/dev/null && [ "$(wc -l < "$t/hashes")" -eq "$(wc -l < "$t/plain")" ]; } \
+          || { : > "$t/err"; fp_why 1; ok=""; }
+      fi
+      if [ -n "$ok" ]; then
+        # each record is "<blob> <name>", the name written as fp_name writes it
+        FP_WHY="$t/why" perl -C0 -0 -e 'sub no_hash { open(my $W, ">", $ENV{FP_WHY}); print $W "h", $_[0]; exit 3 }
+            open(my $H, "<", $ARGV[0]) or exit 4; while (my $f = <STDIN>) { chomp $f; my $h;
+            if ($f =~ /[\n\r]/ || $f =~ /^"/) { open(my $g, "-|", "git", "hash-object", "--", "$ENV{PWD}/$f") or no_hash($f); $h = <$g>; close $g or no_hash($f) }
+            else { local $/ = "\n"; $h = <$H> } defined $h or exit 4; $h =~ s/\n\z//;
+            my $n = $f; if ($n =~ /[\n\\]/) { $n =~ s/\\/\\\\/g; $n =~ s/\n/\\n/g; $n = "\\$n" } print "$h $n\n" }' "$t/hashes" < "$t/list" > "$t/recs" 2> "$t/err"; rc=$?
+        [ "$rc" -eq 0 ] || { fp_why "$rc"; ok=""; }
+      fi
+      if [ -n "$ok" ]; then { shasum -a 256 2>/dev/null || sha256sum; } < "$t/recs" | cut -c1-16; else echo nofp; fi
     else
-      find "${scope[@]}" -type f -not -path './.git/*' -not -path "./${WORKORDERS_DIR:-Workspace/Docs/WorkOrders}/*" -not -path "./${BUGS_DIR:-Workspace/Docs/Bugs}/*" -not -path "./${SESSIONS_DIR:-Workspace/Sessions}/*" \
-           -not -path "./${PIPELINE_ROOT#$PROJECT_ROOT/}/*" -not -path "./$tdir/results/*" -not -path "./$tdir/suites/*" -not -path "./${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}/*" -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path '*/dist/*' 2>/dev/null \
-        | LC_ALL=C sort | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f" 2>/dev/null; done
-    fi | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-16
+      # outside git: each name, then its bytes, streamed into the hash; an unreadable file refuses
+      local fp rc
+      fp="$(while IFS= read -r -d '' f; do
+          [ -r "$f" ] || { if [ -e "$f" ] || [ -L "$f" ]; then printf 'r%s' "$f"; else printf 'g%s' "$f"; fi > "$t/why"; exit 3; }
+          fp_name "$f"; printf '%s\n' "$FP_NAME"; cat "$f" 2>/dev/null || { printf 'r%s' "$f" > "$t/why"; exit 3; }
+        done < "$t/list" | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-16)"; rc=$?
+      if [ "$rc" -eq 0 ] && [ ! -s "$t/why" ]; then echo "$fp"; else fp_why 3; echo nofp; fi
+    fi
     true )
+}
+source_commit() { # the commit the source was at, with a note when the source differs from it
+  ( set +e; cd "$PROJECT_ROOT" 2>/dev/null && git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "none (not a git repository)"; exit 0; }
+    local c ex scope; c="$(git rev-parse --verify -q HEAD 2>/dev/null)" || { echo "none (no commit yet)"; exit 0; }
+    fp_pathspecs
+    if [ -n "$(git status --porcelain --untracked-files=normal -- "${scope[@]}" "${ex[@]}" 2>/dev/null | head -1)" ]; then
+      echo "$c (with uncommitted changes in the source)"
+    else echo "$c"; fi
+    true )
+}
+code_dir_check() { # refuse a CODE_DIR whose fingerprint would cover no code: it would never change, so a change to the code would never stale the evidence
+  [ "$CODE_DIR" = . ] && return 0
+  local p="$PROJECT_ROOT/$CODE_DIR" e
+  [ -d "$p" ] || die "CODE_DIR $CODE_DIR is not a folder in the project"
+  [ "$(cd "$p" 2>/dev/null && pwd -P)" = "$p" ] || die "CODE_DIR $CODE_DIR is or passes through a symbolic link"
+  case "/$CODE_DIR/" in */.git/*) die "CODE_DIR $CODE_DIR is inside .git";; esac
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$CODE_DIR/" in "$e"/*) die "CODE_DIR $CODE_DIR is inside $e, which is pipeline work, not code";; esac
+  done < <(fingerprint_excludes; printf '%s\n' "${WORKSPACE_DIR:-Workspace}")
+  [ "$(cd "$PROJECT_ROOT" && fp_files | head -c 1 | wc -c | tr -d ' ')" -gt 0 ] || die "CODE_DIR $CODE_DIR holds no file the fingerprint reads (empty, ignored by git, or excluded)"
+  return 0
 }
 
 latest_status() { # verification file -> PASS | FAIL | PLAN | none
   local f="$1"; [ -f "$f" ] || { echo none; return; }
   local line; line="$(grep -m1 -E '^\*\*Overall status:\*\*' "$f" || true)"
+  # The status word sits right after the marker. What follows it (the suite path, a note) is never
+  # read: a suite named "EXECUTED — PASS.sh" must not make a failing run read as passed.
+  line="${line#\*\*Overall status:\*\*}"; line="${line# }"
   case "$line" in
-    *RUNNING*) echo RUNNING;;
-    *"EXECUTED — PASS"*|*"EXECUTED - PASS"*) echo PASS;;
-    *"EXECUTED — FAIL"*|*"EXECUTED - FAIL"*) echo FAIL;;
-    *PRECONDITION*) echo PRECOND;;
-    *"NOT EXECUTED"*) echo PLAN;;
+    RUNNING*) echo RUNNING;;
+    "EXECUTED — PASS"*|"EXECUTED – PASS"*|"EXECUTED - PASS"*) echo PASS;;
+    "EXECUTED — FAIL"*|"EXECUTED – FAIL"*|"EXECUTED - FAIL"*) echo FAIL;;
+    "NOT EXECUTED — PRECONDITION"*|"NOT EXECUTED – PRECONDITION"*|"NOT EXECUTED - PRECONDITION"*) echo PRECOND;;
+    "NOT EXECUTED"*) echo PLAN;;
     *) echo none;;
   esac
 }
@@ -388,18 +591,38 @@ cmd_promote() {
   local d; d="$(bug_folder "$n")"; [ -n "$d" ] || die "no BUG-$n"
   [ "$(latest_status "$d/BUG-$n-VERIFICATION.md")" = PASS ] || die "refusing to promote BUG-$n: the latest verification is not EXECUTED — PASS ($(latest_status "$d/BUG-$n-VERIFICATION.md")). Run it:  bug verify $n --run <suite.sh>"
   [ -x "$PIPELINE_ROOT/bin/sanitize" ] || die "bin/sanitize is missing — refusing to promote unscanned work."
-  local rc=0; "$PIPELINE_ROOT/bin/sanitize" "$d" --quiet >/dev/null 2>&1 || rc=$?
-  if [ "$rc" -eq 2 ] && [ "$allow" -eq 0 ]; then die "refusing to promote BUG-$n: fails sanitization. Fix, or pass --allow-unsanitized for a private playbook."; fi
   local slug; slug="$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g')"
   slug="${PROJECT_SLUG:-$slug}"; playbook="${playbook:-$slug}"
-  # PACKS_DIR was the name before 1.4.0 and is still honoured when set; an
-  # install that has not been migrated yet still keeps its content under packs/.
-  local pbase="${PLAYBOOKS_DIR:-${PACKS_DIR:-}}"
-  if [ -z "$pbase" ]; then
-    if [ ! -d "$PIPELINE_ROOT/playbooks" ] && [ -d "$PIPELINE_ROOT/packs" ]; then pbase="$PIPELINE_ROOT/packs"; else pbase="$PIPELINE_ROOT/playbooks"; fi
+  # One folder directly in the playbooks folder, never a path out of it.
+  case "$playbook" in ''|.*|-*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+    die "refusing to promote BUG-$n: '$playbook' is not a playbook name (letters, digits, '.', '_' and '-'; not starting with '.' or '-')";;
+  esac
+  local pbase; pbase="$("$PIPELINE_ROOT/bin/playbook" where)" || exit 1   # the playbooks folder; playbook says why it refuses one
+  # The bug's artifacts/ holds its working files: they stay with the bug, a playbook carries the record
+  # only. The copy is made aside without them, and what is sanitized is exactly what is copied.
+  if [ -e "$d/artifacts" ] || [ -L "$d/artifacts" ]; then
+    { [ -d "$d/artifacts" ] && [ ! -L "$d/artifacts" ]; } || die "refusing to promote BUG-$n: $d/artifacts is not a plain folder"
+  fi
+  local b stage left=0 san; b="$(basename "$d")"
+  local tmpbase="${TMPDIR:-/tmp}"
+  stage="$(mktemp -d "${tmpbase%/}/acp-promote.XXXXXX")" || die "refusing to promote BUG-$n: no room to stage the copy"
+  # the stage goes however this ends, an interrupt included
+  _acp_stage="$stage"; trap 'rm -rf "$_acp_stage"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  cp -R "$d" "$stage/$b" || die "refusing to promote BUG-$n: the copy could not be made"
+  if [ -d "$stage/$b/artifacts" ]; then
+    left="$(find "$stage/$b/artifacts" -type f | wc -l | tr -d ' ')"; rm -rf "$stage/$b/artifacts"
+  fi
+  local rc=0; san="$("$PIPELINE_ROOT/bin/sanitize" "$stage/$b" 2>&1)" || rc=$?
+  if [ "$rc" -eq 2 ] && [ "$allow" -eq 0 ]; then
+    die "refusing to promote BUG-$n: what would be copied (the bug without artifacts/) fails sanitization. The findings, relative to $d:
+$(printf '%s\n' "$san" | { grep -E '^- \*\*\[' || true; } | sed 's/^/    /')
+    Fix them, or pass --allow-unsanitized for a private playbook."
   fi
   local pdir="$pbase/$playbook"; mkdir -p "$pdir/bugs"
-  local b; b="$(basename "$d")"; rm -rf "$pdir/bugs/$b"; cp -R "$d" "$pdir/bugs/$b"
+  rm -rf "$pdir/bugs/$b"; cp -R "$stage/$b" "$pdir/bugs/$b"
+  rm -rf "$stage"; trap - EXIT INT TERM
+  case "$left" in 0) ;; 1) echo "promote: left out artifacts/ (1 file): working files stay with the order, never in a playbook";;
+    *) echo "promote: left out artifacts/ ($left files): working files stay with the order, never in a playbook";; esac
   local entry_dir="$pdir/catalog" entry="$pdir/catalog/BUG-$n.md" issue close root fix
   mkdir -p "$entry_dir"
   issue="$(ls "$d"/BUG-$n-*.md | grep -v -- "-\(CLOSEOUT\|VERIFICATION\|Prompt\)" | head -1 || true)"
@@ -407,12 +630,11 @@ cmd_promote() {
   section() { awk -v h="$2" 'BEGIN{p=0} /^## /{p=($0 ~ h)} p&&!/^## /{print}' "$1" | sed -e '/^[[:space:]]*$/d' -e '/^---*$/d' | head -n "${3:-6}"; }
   root="$( { [ -n "$close" ] && section "$close" "Root Cause" 6; } || { [ -n "$issue" ] && section "$issue" "Root Cause" 6; } || true)"
   fix="$( [ -n "$close" ] && section "$close" "(Fix|Resolution|Solution)" 6 || true)"
-  [ -f "$cat" ] || printf '# Playbook catalog: %s\n\n' "$playbook" > "$cat"
   { printf '## BUG-%s — %s\n\n- **Folder:** `bugs/%s`\n- **Promoted:** %s from project `%s`\n' "$n" "${b#BUG-$n-}" "$b" "$(date +%F)" "$slug"
     [ -n "$root" ] && { printf -- '- **Root cause:**\n'; printf '%s\n' "$root" | sed 's/^/    /'; }
     [ -n "$fix" ]  && { printf -- '- **Fix:**\n'; printf '%s\n' "$fix" | sed 's/^/    /'; }
     printf -- '- **Pitfalls:**\n    _(what would have found this faster? add it)_\n\n'; } > "$entry"
-  PLAYBOOKS_DIR="$pbase" "$PIPELINE_ROOT/bin/playbook" catalog "$playbook" >/dev/null 2>&1 || true
+  "$PIPELINE_ROOT/bin/playbook" catalog "$playbook" >/dev/null || die "BUG-$n was copied to $pdir, but its catalog could not be rebuilt (above)"
   echo "BUG-$n promoted to playbook '$playbook'. Entry: $entry — edit the Pitfalls line now."
 }
 
@@ -438,16 +660,31 @@ cmd_close() {
   local slug out; slug="$(basename "$d")"; slug="${slug#BUG-$n-}"
   out="$d/BUG-$n-$slug-CLOSEOUT.md"
   [ -e "$out" ] && die "$out already exists"
+  # A missing check.py is a refusal, never a silent skip: without it no rule ran at all.
+  [ "${ACP_SKIP_CHECK:-0}" = 1 ] || [ -f "$CHECK" ] || die "refusing to close BUG-$n: the close-time checks are missing ($CHECK not found), so none ran. Reinstall the pipeline, or ACP_SKIP_CHECK=1 with a reason in the closeout."
   if [ -f "$CHECK" ] && [ "${ACP_SKIP_CHECK:-0}" != 1 ]; then
     local crc=0
     if [ -f "$d/.bug-manifest" ]; then
       ( cd "$PROJECT_ROOT" && python3 "$CHECK" --root "$PROJECT_ROOT" --manifest "$d/.bug-manifest" --exclude $(fingerprint_excludes | tr '\n' ' ') ) || crc=$?
     elif ( cd "$PROJECT_ROOT" && git rev-parse --show-toplevel >/dev/null 2>&1 ); then
       ( cd "$PROJECT_ROOT" && python3 "$CHECK" --root "$PROJECT_ROOT" --since HEAD ) || crc=$?
+    else
+      echo "bug: BUG-$n predates the manifest and there is no git; the close-time checks were not run" >&2
     fi
-    [ "$crc" -ne 2 ] || die "refusing to close BUG-$n: the checks above block. Fix them, or ACP_SKIP_CHECK=1 with a reason in the closeout."
+    # check.py exits 0 when nothing blocks and 2 when something does. Any other exit (1: the checks could not
+    # start, 3: they broke part-way, 127: no python3, or a signal) means they did not run to the end, so
+    # nothing may be taken as passed.
+    case "$crc" in
+      0)   ;;
+      2)   die "refusing to close BUG-$n: the checks above block. Fix them, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+      3)   die "refusing to close BUG-$n: the close-time checks broke part-way (check.py exit 3), so they did not run to the end. Fix what the message above names, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+      127) die "refusing to close BUG-$n: the close-time checks could not start (exit 127: python3 not found). Make python3 available, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+      *)   die "refusing to close BUG-$n: the close-time checks did not finish (check.py exit $crc), so nothing may be taken as passed. Fix what the message above names, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+    esac
   fi
   render "$TEMPLATES/BUG-TEMPLATE-CLOSEOUT.md" "$out" "$n" "$slug"
+  # what the CLOSEOUT says, in the meta too: one status line, written as data
+  if grep -q '^status=' "$d/.bug-meta" 2>/dev/null; then perl -C0 -pi -e 's/^status=.*/status=closed/' "$d/.bug-meta"; else printf 'status=closed\n' >> "$d/.bug-meta"; fi
   echo "BUG-$n closeout drafted: $out"
 }
 

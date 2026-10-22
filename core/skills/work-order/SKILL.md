@@ -59,6 +59,11 @@ Add `sdk-implementation` and `ui-implementation` when the work touches those.
 {{PIPELINE_ROOT}}/bin/wo note <n> "<text>"      # dated session note in the spec
 ```
 
+In git, commit the order's documents before `wo start`: it makes the order's branch and a worktree from
+HEAD, and refuses while they are uncommitted. Work in the worktree it prints; run every `wo` command from
+the main checkout. Merge the branch, then `wo verify` and `wo close` (verify tests the main checkout; close
+refuses while the branch is unmerged).
+
 ## Verify
 
 ```bash

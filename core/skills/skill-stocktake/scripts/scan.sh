@@ -94,7 +94,7 @@ scan_dir_to_json() {
   c30=$(date_ago 30)
 
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpbase="${TMPDIR:-/tmp}"; tmpdir=$(mktemp -d "${tmpbase%/}/stocktake-scan.XXXXXX")
   # Use a function to avoid embedding $tmpdir in a quoted string (prevents injection
   # if TMPDIR were crafted to contain shell metacharacters).
   local _scan_tmpdir="$tmpdir"

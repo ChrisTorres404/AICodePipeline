@@ -3,10 +3,11 @@ set -uo pipefail
 cd "$EVAL_TMP" || exit 1
 
 # An installed project: the pipeline vendored at .aicodepipeline, agents and skills
-# copied under .claude. Only the hooks are copied — the hooks derive their own root
-# from where they sit, so the rest of the tree is stand-in files with the same shape.
-mkdir -p proj/.aicodepipeline/core proj/.claude/skills/demo/scripts proj/src
-cp -R "$PIPELINE_ROOT/core/hooks" proj/.aicodepipeline/core/hooks || { echo "could not vendor the hooks"; exit 1; }
+# copied under .claude. Only the hooks and bin/sanitize (which holds the key list) are copied —
+# the hooks derive their own root from where they sit, so the rest of the tree is stand-in files.
+mkdir -p proj/.aicodepipeline/core proj/.aicodepipeline/bin proj/.claude/skills/demo/scripts proj/src
+cp -R "$PIPELINE_ROOT/core/hooks" proj/.aicodepipeline/core/hooks && cp "$PIPELINE_ROOT/bin/sanitize" proj/.aicodepipeline/bin/ \
+  || { echo "could not vendor the hooks"; exit 1; }
 mkdir -p proj/.aicodepipeline/core/skills/demo/scripts
 cd proj || exit 1
 git init -q >/dev/null 2>&1; git config user.email e@x; git config user.name e
@@ -29,7 +30,7 @@ out="$(commit_hook)"; rc=$?
 # --- the project's own code is still reported ---
 printf 'console.log("mine");\n' > src/app.js; git add -A >/dev/null 2>&1
 out="$(commit_hook)"; rc=$?
-[ "$rc" -eq 2 ] || { echo "debug logging in the project's own source was not reported under strict (exit $rc)"; echo "$out"; exit 1; }
+{ [ "$rc" -eq 2 ] && case "$out" in *"Debug logging"*) true;; *) false;; esac; } || { echo "debug logging in the project's own source was not reported under strict (exit $rc)"; echo "$out"; exit 1; }
 case "$out" in *"src/app.js"*) ;; *) echo "the report did not name the project's file:"; echo "$out"; exit 1;; esac
 case "$out" in *.aicodepipeline*) echo "the report named the vendored pipeline:"; echo "$out"; exit 1;; *) ;; esac
 case "$out" in *.claude*) echo "the report named the installed .claude copies:"; echo "$out"; exit 1;; *) ;; esac
@@ -50,8 +51,8 @@ out="$(python3 "$CK" --root . --strict --paths src/app.js 2>&1)"; rc=$?
 
 # --- a checkout of the pipeline is itself a project: the rules still run there ---
 cd "$EVAL_TMP" || exit 1
-mkdir -p self/core src
-cp -R "$PIPELINE_ROOT/core/hooks" self/core/hooks
+mkdir -p self/core self/bin src
+cp -R "$PIPELINE_ROOT/core/hooks" self/core/hooks && cp "$PIPELINE_ROOT/bin/sanitize" self/bin/
 cd self || exit 1
 git init -q >/dev/null 2>&1; git config user.email e@x; git config user.name e
 mkdir -p core/skills; printf 'console.log("the pipeline own source");\n' > core/skills/build.js

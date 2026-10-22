@@ -226,7 +226,7 @@ run_suite() {
         local log_file
         # an explicit template: BSD mktemp treats -t as a prefix, GNU mktemp
         # requires the XXXXXX and rejects a bare prefix.
-        log_file="$(mktemp "${TMPDIR:-/tmp}/harness-suite.XXXXXX")"
+        tmpbase="${TMPDIR:-/tmp}"; log_file="$(mktemp "${tmpbase%/}/harness-suite.XXXXXX")"
         if "$full_path" > "$log_file" 2>&1; then
             elapsed=$(( $(date +%s) - suite_start ))
             echo -e "\r  ${GREEN}PASS${NC} $name ${DIM}(${elapsed}s)${NC}                    "

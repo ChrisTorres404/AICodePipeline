@@ -43,7 +43,7 @@ for d in "$wo_dir"/*/ "$bug_dir"/*/; do
   adopted=$((adopted + 1))
   for v in "$d"*VERIFICATION*.md; do
     [ -f "$v" ] || continue
-    grep -qE 'EXECUTED (—|-) PASS' "$v" || continue
+    grep -qE 'EXECUTED (—|–|-) PASS' "$v" || continue   # all three dashes
     logged=0
     for l in "$d"*VERIFICATION-*.log; do [ -f "$l" ] && logged=1; done
     if [ "$logged" -eq 0 ]; then

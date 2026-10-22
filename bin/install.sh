@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # install.sh — render the pipeline into a target project
 #
-#   bin/install.sh /path/to/project [--dry-run] [--profile minimal|standard|full]
+#   bin/install.sh /path/to/project [--dry-run] [--profile minimal|standard|full] [--pipeline-dir P --code-dir C]
 #
 #   minimal   rules, agents, commands, the six lifecycle skills; no hooks
 #   standard  everything above plus all skills and hooks           (default)
@@ -19,10 +19,10 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 case "${1:-}" in -h|--help|"") sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:+0}";; esac
-TARGET="${1:-}"; DRY=""; PROFILE="${ACP_PROFILE:-standard}"
+TARGET="${1:-}"; DRY=""; PROFILE="${ACP_PROFILE:-standard}"; LAYOUT_P=""; LAYOUT_C=""
 _args=("${@:2}"); i=0
 while [ $i -lt ${#_args[@]} ]; do a="${_args[$i]}"
-  case "$a" in --dry-run) DRY="--dry-run";; --profile=*) PROFILE="${a#--profile=}";; --profile) i=$((i+1)); PROFILE="${_args[$i]:-}";; minimal|standard|full) PROFILE="$a";; *) echo "install: unknown argument '$a'" >&2; exit 1;; esac
+  case "$a" in --dry-run) DRY="--dry-run";; --profile=*) PROFILE="${a#--profile=}";; --profile) i=$((i+1)); PROFILE="${_args[$i]:-}";; --pipeline-dir|--code-dir) v="${_args[$((i+1))]:-}"; case "$v" in ''|-*) echo "usage: bin/install.sh /path/to/project [--pipeline-dir P --code-dir C] (each flag takes a folder name)" >&2; exit 1;; esac; if [ "$a" = --pipeline-dir ]; then LAYOUT_P="$v"; else LAYOUT_C="$v"; fi; i=$((i+1));; minimal|standard|full) PROFILE="$a";; *) echo "install: unknown argument '$a'" >&2; exit 1;; esac
   i=$((i+1)); done
 case "$PROFILE" in minimal|standard|full) ;; *) echo "install: --profile must be minimal, standard, or full" >&2; exit 1;; esac
 [ -n "$TARGET" ] || { echo "usage: bin/install.sh /path/to/project [--dry-run]" >&2; exit 1; }
@@ -46,11 +46,61 @@ CONFIG="$TARGET/pipeline.config.sh"
 : "${TESTING_DIR:?set TESTING_DIR in pipeline.config.sh}"
 : "${SESSIONS_DIR:?set SESSIONS_DIR in pipeline.config.sh}"
 export API_BASE_URL="${API_BASE_URL:-http://localhost:3001/api/v1}" WEB_ORIGIN="${WEB_ORIGIN:-http://localhost:3000}"
+# Every path below is the config's, under PROJECT_ROOT: it must be this project, or install would scan and write elsewhere.
+case "${PROJECT_ROOT:-}" in /*) [ "$PROJECT_ROOT" -ef "$TARGET" ];; *) false;; esac \
+  || { printf 'install: pipeline.config.sh sets PROJECT_ROOT to %q, not this project (%s); it should be the file'"'"'s own folder:  export PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"; nothing was written\n' "${PROJECT_ROOT:-}" "$TARGET" >&2; exit 1; }
+# The two-folder layout (acp layout writes it): with --pipeline-dir and --code-dir, the repository must hold that
+# layout and the config must state it exactly, or nothing is written. The repository is checked first, so a
+# project still laid out the old way is told to move, not to rewrite its config. Anything unusual is refused.
+if [ -n "$LAYOUT_P$LAYOUT_C" ]; then
+  lay_bad() { echo "install: $*; nothing was written" >&2; exit 1; }
+  lay_lc() { printf '%s' "$1" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'; }
+  for v in "$LAYOUT_P" "$LAYOUT_C"; do
+    case "$v" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*|.*|-*|'') lay_bad "--pipeline-dir and --code-dir are given together, each one folder name (letters, digits, '.', '_', '-'; not starting with '.' or '-')";; esac
+    case "$(lay_lc "$v")" in workspace|pipeline.config.sh|agents.md|claude.md) lay_bad "$v is a name the layout or the tools use at the top of the repository (in any case)";; esac
+  done
+  [ "$(lay_lc "$LAYOUT_P")" != "$(lay_lc "$LAYOUT_C")" ] || lay_bad "the pipeline folder and the code folder must differ, also ignoring case"
+  for x in .aicodepipeline Workspace; do
+    { [ ! -e "$TARGET/$x" ] && [ ! -L "$TARGET/$x" ]; } || lay_bad "$x at the top of the repository belongs to the single-folder layout; move the project with  acp migrate  (plan, backup, then apply) first"
+  done
+  { [ -d "$TARGET/$LAYOUT_C" ] && [ ! -L "$TARGET/$LAYOUT_C" ]; } || lay_bad "$LAYOUT_C/ must be a folder in the repository, not missing, a file or a link"
+  { [ ! -L "$TARGET/$LAYOUT_P" ] && { [ ! -e "$TARGET/$LAYOUT_P" ] || [ -d "$TARGET/$LAYOUT_P" ]; }; } || lay_bad "$LAYOUT_P must be a folder or absent, not a file or a link"
+  for x in .aicodepipeline Workspace pipeline.config.sh; do
+    { [ ! -e "$TARGET/$LAYOUT_C/$x" ] && [ ! -L "$TARGET/$LAYOUT_C/$x" ]; } || lay_bad "$LAYOUT_C/$x: pipeline files do not belong in the code folder"
+  done
+  { [ ! -e "$TARGET/$LAYOUT_P/pipeline.config.sh" ] && [ ! -L "$TARGET/$LAYOUT_P/pipeline.config.sh" ]; } || lay_bad "$LAYOUT_P/pipeline.config.sh: the config lives at the top of the repository, not in $LAYOUT_P/"
+  for gl in '*.log' '.acp-migration/'; do   # logs and the migration's records never enter git
+    grep -qxF -- "$gl" "$TARGET/.gitignore" 2>/dev/null || lay_bad ".gitignore must hold the line  $gl  (new-project writes it; install does not edit project files)"
+  done
+  lay_miss=""
+  for kv in "PIPELINE_ROOT=$LAYOUT_P/.aicodepipeline" "WORKSPACE_DIR=$LAYOUT_P/Workspace" "DOCS_DIR=$LAYOUT_P/Workspace/Docs" \
+            "WORKORDERS_DIR=$LAYOUT_P/Workspace/Docs/WorkOrders" "BUGS_DIR=$LAYOUT_P/Workspace/Docs/Bugs" "TESTING_DIR=$LAYOUT_P/Workspace/Testing" \
+            "KNOWLEDGE_DIR=$LAYOUT_P/Workspace/Docs/KnowledgeBase" "SESSIONS_DIR=$LAYOUT_P/Workspace/Sessions" "CODE_DIR=$LAYOUT_C" \
+            "PLAYBOOKS_DIR=$LAYOUT_P/playbooks"; do
+    k="${kv%%=*}"; [ "${!k-}" = "${kv#*=}" ] || lay_miss="$lay_miss $k"
+  done
+  [ -z "$lay_miss" ] || lay_bad "pipeline.config.sh does not state the $LAYOUT_P/ + $LAYOUT_C/ layout (differs:$lay_miss); run  acp layout --pipeline-dir $LAYOUT_P --code-dir $LAYOUT_C  first"
+fi
+# Something at the old place that is not the configured pipeline: an install here would be taken for a first install
+# and write beside it. A pipeline copy (it holds bin/acp or core/) is moved, or reinstalled in place; anything else is in the way.
+if { [ -e "$TARGET/.aicodepipeline" ] || [ -L "$TARGET/.aicodepipeline" ]; } && [ ! "$TARGET/.aicodepipeline" -ef "$TARGET/$PIPELINE_ROOT" ]; then
+  if [ -f "$TARGET/.aicodepipeline/bin/acp" ] || [ -d "$TARGET/.aicodepipeline/core" ]; then
+    echo "install: .aicodepipeline at the top of the project is a pipeline copy, but pipeline.config.sh names $PIPELINE_ROOT; set PIPELINE_ROOT back to .aicodepipeline to reinstall in place, or move the project with  acp migrate  (plan, backup, then apply) first; nothing was written" >&2
+  else
+    echo "install: .aicodepipeline at the top of the project is in the way (it is not the pipeline pipeline.config.sh names, $PIPELINE_ROOT); move it aside; nothing was written" >&2
+  fi
+  exit 1
+fi
+# The playbooks folder, as playbook decides it for the drivers, checked before anything is written.
+PBD="$TARGET/$PIPELINE_ROOT/playbooks"
+if [ -n "${PLAYBOOKS_DIR:-}" ]; then
+  PBD="$("$SRC/bin/playbook" where --project "$TARGET")" || { echo "install: the playbooks folder is refused (above); nothing was written" >&2; exit 1; }
+fi
 
 VARS=(PROJECT_NAME PROJECT_SLUG PROJECT_DOMAIN GITHUB_REPO PROJECT_ROOT PIPELINE_ROOT
-      WORKSPACE_DIR DOCS_DIR WORKORDERS_DIR BUGS_DIR TESTING_DIR SESSIONS_DIR KNOWLEDGE_DIR
+      WORKSPACE_DIR DOCS_DIR WORKORDERS_DIR BUGS_DIR TESTING_DIR SESSIONS_DIR KNOWLEDGE_DIR CODE_DIR LAYOUT_ROOT_EXTRA
       API_APP ADMIN_APP PORTAL_APP DEV_APP WEB_APP SDK_PKG DB_NAME CLI_NAME API_BASE_URL WEB_ORIGIN
-      PROJECT_DOMAIN_RE DEV_SUBDOMAINS PROD_IP)
+      PROJECT_DOMAIN_RE DEV_SUBDOMAINS PROD_IP WORKTREE_DISPOSABLE)
 
 DEST="$TARGET/$PIPELINE_ROOT"
 if [ -e "$DEST" ] && [ "$(cd "$DEST" && pwd -P)" = "$(cd "$SRC" && pwd -P)" ]; then
@@ -63,6 +113,10 @@ if [ -e "$DEST" ] && [ "$(cd "$DEST" && pwd -P)" = "$(cd "$SRC" && pwd -P)" ]; t
   exit 1
 fi
 say() { echo "  $*"; }
+# The work-order and bug folders are the pipeline's own. A .gitignore in each keeps every order's artifacts/ out of
+# git (in a clone and an order's worktree too); it is checked before anything is written, and kept current below.
+OI="$SRC/core/hooks/order-ignore.py"
+oi_plan="$(python3 "$OI" "$TARGET/$WORKORDERS_DIR" "$TARGET/$BUGS_DIR" --dry-run)" || { echo "install: nothing was written" >&2; exit 1; }
 
 echo "Installing AICodePipeline ($PROFILE profile)"
 echo "  from : $SRC"
@@ -76,6 +130,7 @@ if [ "$DRY" = "--dry-run" ]; then
   find "$SRC/core" "$SRC/harness" -type f | sed "s|$SRC/|    |"
   echo "Would create: $TARGET/{$WORKORDERS_DIR,$BUGS_DIR,$TESTING_DIR/suites,$SESSIONS_DIR/{active,archive}}"
   echo "Would link:   $TARGET/.claude/{agents,commands}"
+  [ -z "$oi_plan" ] || printf '%s\n' "$oi_plan" | sed 's/^would write /Would write: /'
   exit 0
 fi
 
@@ -86,6 +141,10 @@ mkdir -p "$DEST"
 # temporary directory meant a failed install left them stranded: the project had
 # already lost them, and the retry had nothing left to preserve. They are kept
 # with the project instead, and only discarded once the install has committed.
+# An upgrade leaves the project's own files alone (D-3): a pipeline already installed here, or a knowledge base
+# already written, means this is not a first install, and the knowledge base is not written below.
+ACP_UPGRADE=0
+{ [ -d "$DEST/core" ] || [ -e "$TARGET/${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}" ]; } && ACP_UPGRADE=1
 RECOVERY="$DEST/.acp-install-recovery"
 
 if [ -d "$RECOVERY" ]; then
@@ -113,6 +172,7 @@ printf '%s\n' "$(cd "$SRC" && pwd -P)" > "$DEST/.source"
 mkdir -p "$DEST/core/agents/overlays"; cp -R "$RECOVERY/overlays/." "$DEST/core/agents/overlays/" 2>/dev/null || true
 [ -n "$(ls -A "$RECOVERY/harness-config" 2>/dev/null)" ] && { cp -R "$RECOVERY/harness-config/." "$DEST/harness/config/"; say "harness/config kept from the previous install"; }
 echo "$PROFILE" > "$DEST/.profile"
+sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$SRC/bin/acp" | head -1 > "$DEST/VERSION"   # the ACP version this copy is, read where the build reads it
 mkdir -p "$DEST/bin"
 cp -p "$SRC/bin/acp" "$SRC/bin/wo" "$SRC/bin/bug" "$SRC/bin/playbook" "$SRC/bin/pack" "$SRC/bin/sanitize" "$SRC/bin/detect-stack" "$SRC/bin/stack-specialist" "$SRC/bin/new-project" "$SRC/bin/install.sh" "$SRC/bin/build-plugin" "$SRC/bin/eval" "$SRC/bin/lint" "$DEST/bin/"
 mkdir -p "$DEST/bin/dev"
@@ -124,9 +184,9 @@ if [ -d "$DEST/packs" ] && [ -n "$(ls -A "$DEST/packs" 2>/dev/null)" ] && [ ! -d
   mv "$DEST/packs" "$DEST/playbooks"
   say "moved packs/ to playbooks/ (packs/ was the old name)"
 fi
-mkdir -p "$DEST/playbooks"
-[ -f "$DEST/playbooks/README.md" ] || cp "$SRC/playbooks/README.md" "$DEST/playbooks/README.md"
-[ -f "$DEST/playbooks/INDEX.md" ] || cp "$SRC/playbooks/INDEX.md" "$DEST/playbooks/INDEX.md"
+mkdir -p "$PBD"
+[ -f "$PBD/README.md" ] || cp "$SRC/playbooks/README.md" "$PBD/README.md"
+[ -f "$PBD/INDEX.md" ] || cp "$SRC/playbooks/INDEX.md" "$PBD/INDEX.md"
 say "copied core/ harness/ bin/ and an empty playbooks/"
 
 export "${VARS[@]}"
@@ -181,6 +241,8 @@ mkdir -p "$TARGET/$WORKORDERS_DIR" "$TARGET/$BUGS_DIR" \
          "$TARGET/$SESSIONS_DIR/active" "$TARGET/$SESSIONS_DIR/archive"
 [ -f "$TARGET/$TESTING_DIR/suites.manifest" ] || cp "$DEST/harness/config/suites.manifest" "$TARGET/$TESTING_DIR/suites.manifest"
 say "created workspace folders (suite manifest: $TESTING_DIR/suites.manifest)"
+oi_done="$(python3 "$OI" "$TARGET/$WORKORDERS_DIR" "$TARGET/$BUGS_DIR")" || { echo "install: the work-order and bug folders' .gitignore could not be kept (above)" >&2; exit 1; }
+[ -z "$oi_done" ] || printf '%s\n' "$oi_done" | while IFS= read -r l; do say "order working files stay out of git: ${l#"$TARGET"/}"; done
 
 # --- 3. Wire agents and slash commands into .claude/ ---------------------
 mkdir -p "$TARGET/.claude/agents" "$TARGET/.claude/commands"
@@ -490,7 +552,7 @@ fi
 # project has been measured and described. Those are work orders, opened here.
 if [ -d "$DEST/core/templates/intake" ] && [ -x "$DEST/bin/acp" ]; then
   echo; echo "Intake — the work orders this project completes before it is operational:"
-  (cd "$TARGET" && "$DEST/bin/acp" intake 2>&1 | sed 's/^/  /') || true
+  (cd "$TARGET" && ACP_INSTALL_UPGRADE="$ACP_UPGRADE" "$DEST/bin/acp" intake 2>&1 | sed 's/^/  /') || true
 fi
 
 echo

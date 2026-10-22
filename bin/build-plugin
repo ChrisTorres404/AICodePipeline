@@ -64,8 +64,8 @@ cat > "$OUT/.claude-plugin/plugin.json" <<JSON
   "version": "$VERSION",
   "description": "Christian Torres's AI engineering pipeline: an evidence-gated work-order lifecycle, a bug lifecycle, playbooks of precedent, a behavioral test harness, 96 agents, skills, hooks with profiles, per-language rules, and a source-traced documentation lifecycle.",
   "author": { "name": "Christian Torres", "url": "https://github.com/ChrisTorres404" },
-  "homepage": "https://github.com/ChrisTorres404/AICodeAssist",
-  "repository": "https://github.com/ChrisTorres404/AICodeAssist",
+  "homepage": "https://github.com/ChrisTorres404/AICodePipeline",
+  "repository": "https://github.com/ChrisTorres404/AICodePipeline",
   "license": "MIT",
   "keywords": ["work-orders", "evidence", "behavioral-testing", "agents", "skills", "hooks", "rules", "methodology"],
   "userConfig": {

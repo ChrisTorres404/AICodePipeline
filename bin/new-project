@@ -5,6 +5,7 @@
 #   bin/new-project <path> [--name "Display Name"] [--domain example.com]
 #                          [--playbook <name>]... [--agent-set <name>]... [--skill-set <name>]... [--profile minimal|standard|full]
 #                          [--no-git] [--allow-unsanitized] [--kb-level lite|standard|full]
+#                          [--pipeline-dir P --code-dir C]   the P/ (pipeline) + C/ (code) layout in one repository
 #
 # Creates the directory, writes pipeline.config.sh from your answers, installs
 # the pipeline (agents, skills, hooks, commands, harness), scaffolds the
@@ -16,7 +17,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-TARGET="" NAME="" DOMAIN="" DO_GIT=1 KB_LEVEL="lite" ALLOW_UNSANITIZED=0 AGENT_SETS_WANTED="" SKILL_SETS_WANTED="" PROFILE="standard"; PLAYBOOKS_WANTED=()
+TARGET="" NAME="" DOMAIN="" DO_GIT=1 KB_LEVEL="lite" ALLOW_UNSANITIZED=0 AGENT_SETS_WANTED="" SKILL_SETS_WANTED="" PROFILE="standard"; PLAYBOOKS_WANTED=(); LAYOUT_P=""; LAYOUT_C=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --name)   NAME="$2"; shift 2;;
@@ -28,12 +29,58 @@ while [ $# -gt 0 ]; do
     --kb-level) KB_LEVEL="$2"; shift 2;;
     --profile) PROFILE="$2"; shift 2;;
     --allow-unsanitized) ALLOW_UNSANITIZED=1; shift;;
-    -h|--help) sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
+    --pipeline-dir|--code-dir) case "${2:-}" in ""|-*) echo "new-project: $1 takes a folder name" >&2; exit 1;; esac
+                     if [ "$1" = --pipeline-dir ]; then LAYOUT_P="$2"; else LAYOUT_C="$2"; fi; shift 2;;
+    -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0;;
     -*) echo "new-project: unknown flag $1" >&2; exit 1;;
     *)  TARGET="$1"; shift;;
   esac
 done
-[ -n "$TARGET" ] || { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+[ -n "$TARGET" ] || { sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1; }
+
+# Every value is checked before anything is made: the name and the domain are written into
+# pipeline.config.sh and other files run as shell, and the levels, sets and playbooks choose files by name.
+# Character lists are spelled out, so the locale cannot widen them.
+die_np() { echo "new-project: $*" >&2; exit 1; }
+case "$KB_LEVEL" in lite|standard|full) ;; *) die_np "--kb-level must be lite, standard or full";; esac
+case "$PROFILE" in minimal|standard|full) ;; *) die_np "--profile must be minimal, standard or full";; esac
+if [ -n "$LAYOUT_P$LAYOUT_C" ]; then   # the two-folder layout: both names, each one folder, not a name the tools use, different
+  for v in "$LAYOUT_P" "$LAYOUT_C"; do
+    case "$v" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*|.*|-*|'') die_np "--pipeline-dir and --code-dir are given together, each one folder name (letters, digits, '.', '_', '-'; not starting with '.' or '-')";; esac
+    case "$(printf '%s' "$v" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" in workspace|pipeline.config.sh|agents.md|claude.md) die_np "$v is a name the layout or the tools use at the top of the repository (in any case)";; esac
+  done
+  [ "$(printf '%s' "$LAYOUT_P" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" != "$(printf '%s' "$LAYOUT_C" | LC_ALL=C tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" ] \
+    || die_np "the pipeline folder and the code folder must differ, also ignoring case"
+fi
+if [ -n "$DOMAIN" ]; then
+  case "$DOMAIN" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.-]*|.*|*.|-*|*-|*..*|*.-*|*-.*) die_np "--domain must be a host name such as example.com";;
+    *.*) ;;
+    *) die_np "--domain must be a host name such as example.com";;
+  esac
+  case "${DOMAIN##*.}" in   # a number such as 127.0.0.1 is not a host name; it would match other hosts' lines
+    *[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]*) ;;
+    *) die_np "--domain must be a host name such as example.com";;
+  esac
+fi
+set -f
+np_sets=""
+for s in $AGENT_SETS_WANTED; do
+  case "$s" in *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|-*) die_np "'$s' is not an agent set name";; esac
+  [ -d "$SRC/core/agents/sets/$s" ] || die_np "there is no agent set '$s' (see core/agents/sets/)"
+  np_sets="$np_sets $s"
+done
+AGENT_SETS_WANTED="$np_sets"; np_sets=""   # written as checked: one line, single spaces
+for s in $SKILL_SETS_WANTED; do
+  case "$s" in *[!abcdefghijklmnopqrstuvwxyz0123456789-]*|-*) die_np "'$s' is not a skill set name";; esac
+  [ -d "$SRC/core/skill-sets/$s" ] || die_np "there is no skill set '$s' (see core/skill-sets/)"
+  np_sets="$np_sets $s"
+done
+SKILL_SETS_WANTED="$np_sets"
+set +f
+for p in ${PLAYBOOKS_WANTED[@]+"${PLAYBOOKS_WANTED[@]}"}; do   # a playbook is named, never reached by a path
+  case "$p" in ''|.*|-*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) die_np "'$p' is not a playbook name";; esac
+done
 
 if [ -e "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
   echo "new-project: $TARGET exists and is not empty." >&2
@@ -41,6 +88,7 @@ if [ -e "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
   exit 1
 fi
 
+CREATED=0; [ -e "$TARGET" ] || CREATED=1
 mkdir -p "$TARGET"
 TARGET="$(cd "$TARGET" && pwd)"
 BASE="$(basename "$TARGET")"
@@ -75,6 +123,21 @@ p.write_text(s)
 PYEOF
 }
 [ -n "$NAME" ]   || NAME="$BASE"
+# The name checks below refuse characters, so they run byte by byte (LC_ALL=C): in a multibyte
+# locale such as Shift-JIS a refused byte can hide inside the character before it.
+np_lc="${LC_ALL-}"; np_lcset="${LC_ALL+1}"; LC_ALL=C
+case "$NAME" in *[[:cntrl:]]*)   # from --name or from the folder; the folder made here is removed
+  [ "$CREATED" = 1 ] && rmdir "$TARGET" 2>/dev/null
+  die_np "the project's name holds a newline, tab or other control character; give a --name on one line";; esac
+# The name is also written into installed shell scripts, inside quotes, and into an awk pattern,
+# where a bar widens the match: the characters that end or expand a quote, and the bar, are refused
+# rather than escaped for one place.
+case "$NAME" in *[\"\'\`\$\\/\|]*)
+  [ "$CREATED" = 1 ] && rmdir "$TARGET" 2>/dev/null
+  die_np "the project's name holds a quote, backtick, dollar, backslash, slash or bar; give a --name without them";; esac
+if [ -n "$np_lcset" ]; then LC_ALL="$np_lc"; else unset LC_ALL; fi
+[ -n "$(slugify "$NAME")" ] || { [ "$CREATED" = 1 ] && rmdir "$TARGET" 2>/dev/null
+  die_np "the project's name has no letter or digit, so it gives no short name; give a --name with one"; }
 SLUG="$(slugify "$NAME")"
 [ -n "$DOMAIN" ] || DOMAIN="${SLUG}.local"
 DOMAIN_RE="$(echo "$DOMAIN" | sed 's/\./\\./g')"
@@ -86,17 +149,30 @@ echo "  domain : $DOMAIN"
 echo
 
 # --- 1. Project binding ----------------------------------------------------
-sed -e "s|^export PROJECT_NAME=.*|export PROJECT_NAME=\"$NAME\"|" \
-    -e "s|^export PROJECT_SLUG=.*|export PROJECT_SLUG=\"$SLUG\"|" \
-    -e "s|^export PROJECT_DOMAIN=.*|export PROJECT_DOMAIN=\"$DOMAIN\"|" \
-    -e "s|^export PROJECT_DOMAIN_RE=.*|export PROJECT_DOMAIN_RE=\"${DOMAIN_RE//\\/\\\\}\"|" \
-    -e 's|^export PROJECT_ROOT=.*|export PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" \&\& pwd -P)"   # the directory this file lives in; portable across clones|' \
-    -e "s|^export DB_NAME=.*|export DB_NAME=\"${SLUG//-/_}_dev\"|" \
-    -e "s|^export KNOWLEDGE_LEVEL=.*|export KNOWLEDGE_LEVEL=\"${KB_LEVEL:-lite}\"|" \
-    -e "s|^export AGENT_SETS=.*|export AGENT_SETS=\"${AGENT_SETS_WANTED# }\"|" \
-    -e "s|^export SKILL_SETS=.*|export SKILL_SETS=\"${SKILL_SETS_WANTED# }\"|" \
-    "$SRC/pipeline.config.example.sh" > "$TARGET/pipeline.config.sh"
+# Each value is written as data, not as part of a sed program, so a | or & in a name is text.
+# The lines are the same as before for any value the old sed wrote correctly.
+NP_NAME="$NAME" NP_SLUG="$SLUG" NP_DOMAIN="$DOMAIN" NP_KB="$KB_LEVEL" NP_AS="${AGENT_SETS_WANTED# }" NP_SS="${SKILL_SETS_WANTED# }" \
+  python3 -I - "$SRC/pipeline.config.example.sh" "$TARGET/pipeline.config.sh" <<'PYEOF'
+import os, re, sys
+src, dst = sys.argv[1:3]; e = os.environ
+q = lambda v: '"' + v + '"'   # every value is checked first: none holds a quote, dollar, backtick or backslash
+vals = {"PROJECT_NAME": q(e["NP_NAME"]), "PROJECT_SLUG": q(e["NP_SLUG"]), "PROJECT_DOMAIN": q(e["NP_DOMAIN"]),
+        "PROJECT_DOMAIN_RE": '"' + e["NP_DOMAIN"].replace(".", "\\.") + '"',   # the domain is checked: only its dots need escaping
+        "DB_NAME": q(e["NP_SLUG"].replace("-", "_") + "_dev"), "KNOWLEDGE_LEVEL": q(e["NP_KB"]),
+        "AGENT_SETS": q(e["NP_AS"]), "SKILL_SETS": q(e["NP_SS"]),
+        "PROJECT_ROOT": '"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"   # the directory this file lives in; portable across clones'}
+out = []
+for line in open(src, encoding="utf-8").read().split("\n"):
+    m = re.match(r"export ([A-Z_]+)=", line)
+    if m and m.group(1) in vals: line = "export %s=%s" % (m.group(1), vals[m.group(1)])
+    out.append(line)
+open(dst, "w", encoding="utf-8").write("\n".join(out))
+PYEOF
 echo "  wrote pipeline.config.sh"
+if [ -n "$LAYOUT_P" ]; then   # the code folder first: acp layout refuses a layout whose code folder is not there
+  mkdir -p "$TARGET/$LAYOUT_C"; : > "$TARGET/$LAYOUT_C/.gitkeep"   # git keeps no empty folder, and install refuses a clone without it
+  ( cd "$TARGET" && "$SRC/bin/acp" layout --pipeline-dir "$LAYOUT_P" --code-dir "$LAYOUT_C" ) | sed 's/^/  /'
+fi
 
 # --- 2. Install the pipeline ----------------------------------------------
 # The repository comes first: install wires a git commit-msg hook, and it can only
@@ -104,13 +180,47 @@ echo "  wrote pipeline.config.sh"
 if [ "$DO_GIT" -eq 1 ] && command -v git >/dev/null 2>&1 && [ ! -d "$TARGET/.git" ]; then
   ( cd "$TARGET" && git init -q ) && echo "  git initialised"
 fi
-"$SRC/bin/install.sh" "$TARGET" --profile "$PROFILE" | sed 's/^/  /'
+# Repo hygiene first: install checks that the two-folder layout keeps logs and the migration's records out of git.
+cat > "$TARGET/.gitignore" <<'GIEOF'
+node_modules/
+__pycache__/
+dist/
+build/
+.env
+.env.local
+*.log
+.DS_Store
+*.swp
+*~
+\#*#
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+id_ecdsa*
+!*.pub
+.venv/
+venv/
+coverage/
+.pytest_cache/
+*.tmp
+GIEOF
+if [ -n "$LAYOUT_P" ]; then printf '.acp-migration/\n' >> "$TARGET/.gitignore"; fi
+
+"$SRC/bin/install.sh" "$TARGET" --profile "$PROFILE" ${LAYOUT_P:+--pipeline-dir "$LAYOUT_P" --code-dir "$LAYOUT_C"} | sed 's/^/  /'
 
 # --- 3. Playbooks ----------------------------------------------------------
 PIPELINE_ROOT_VAL="$(. "$TARGET/pipeline.config.sh"; echo "$PIPELINE_ROOT")"
 DEST="$TARGET/$PIPELINE_ROOT_VAL"
+PBD="$( . "$TARGET/pipeline.config.sh"; "$SRC/bin/playbook" where --project "$TARGET")"   # as install, which has checked it
 if [ ${#PLAYBOOKS_WANTED[@]} -gt 0 ]; then
-  mkdir -p "$DEST/playbooks"
+  mkdir -p "$PBD"
   for p in "${PLAYBOOKS_WANTED[@]}"; do
     if [ -d "$SRC/playbooks/$p" ]; then
       rc=0; "$SRC/bin/sanitize" "$SRC/playbooks/$p" --quiet >/dev/null 2>&1 || rc=$?
@@ -122,8 +232,8 @@ if [ ${#PLAYBOOKS_WANTED[@]} -gt 0 ]; then
           continue
         fi
       fi
-      cp -R "$SRC/playbooks/$p" "$DEST/playbooks/"
-      echo "  playbook installed: $p ($(du -sh "$DEST/playbooks/$p" | cut -f1))"
+      cp -R "$SRC/playbooks/$p" "$PBD/"
+      echo "  playbook installed: $p ($(du -sh "$PBD/$p" | cut -f1))"
     else
       echo "  WARNING: no playbook named '$p' — available: $(ls "$SRC/playbooks" 2>/dev/null | tr '\n' ' ')" >&2
     fi
@@ -166,18 +276,7 @@ The instructions above are the same ones every other agent reads. What is specif
 CLEOF
 echo "  wrote CLAUDE.md (imports AGENTS.md, plus what is specific to Claude Code)"
 
-# --- 5. Repo hygiene + first commit ---------------------------------------
-cat > "$TARGET/.gitignore" <<'GIEOF'
-node_modules/
-__pycache__/
-dist/
-build/
-.env
-.env.local
-*.log
-.DS_Store
-GIEOF
-
+# --- 5. First commit ---------------------------------------------------------
 if [ "$DO_GIT" -eq 1 ] && command -v git >/dev/null 2>&1; then
   ( cd "$TARGET" && git init -q 2>/dev/null; git add -A \
     && git commit -q -m "Initialise $NAME with AICodePipeline" ) && echo "  first commit recorded"

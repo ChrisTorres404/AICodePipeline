@@ -40,13 +40,13 @@ SUITES_DIR="$W/suites" bash harness/runners/test-runner.sh --list >/dev/null 2>&
   || fail "the interactive runner cannot list the inventory"
 [ -e "$W/test-results" ] && fail "the interactive runner created test-results"
 
-if command -v node >/dev/null 2>&1; then
-  printf '| 1.1 | Thing | Does a thing | EXECUTED — PASS |\n' > "$W/v.md"
-  TEST_RESULTS_DIR="$W/results" node harness/scripts/calculate-coverage.js "$W/v.md" >/dev/null 2>&1
-  [ -f "$W/results/coverage-summary.txt" ] \
-    || fail "the coverage summary did not land in the results directory"
-  [ -e "$W/test-results" ] && fail "the coverage report created test-results"
-fi
+# A check that cannot run must not pass: without node the coverage check would be skipped silently.
+command -v node >/dev/null 2>&1 || fail "node is not on PATH: the coverage summary check cannot run"
+printf '| 1.1 | Thing | Does a thing | EXECUTED — PASS |\n' > "$W/v.md"
+TEST_RESULTS_DIR="$W/results" node harness/scripts/calculate-coverage.js "$W/v.md" >/dev/null 2>&1
+[ -f "$W/results/coverage-summary.txt" ] \
+  || fail "the coverage summary did not land in the results directory"
+[ -e "$W/test-results" ] && fail "the coverage report created test-results"
 
 # --- the old name is gone from everything that ships ------------------------
 hits="$(grep -rn 'test-results' harness core docs 2>/dev/null | grep -v '^harness/evals/' || true)"

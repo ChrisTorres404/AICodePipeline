@@ -1,0 +1,3 @@
+# migrate-rollback
+
+Proves: after a real acp migrate apply, acp migrate rollback puts the project back exactly as its backup holds it (every entry, .git, links, modes and times), keeps the migrated project whole beside it and removes nothing; refuses, touching nothing, whatever it cannot account for (a project never migrated or already restored, an interrupted apply unless asked, another archive or manifest, a copy of the project, a change after apply, a held lock, a read-only parent); and a rollback stopped part-way is read by device and inode by every acp migrate command, never suggesting a move onto a taken name.

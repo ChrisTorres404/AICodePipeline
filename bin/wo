@@ -7,7 +7,8 @@
 #   * four documents are required at creation
 #   * a closeout may not be produced before a verification exists
 #
-#   wo new "<title>" [--size trivial|small|standard|large] [--area A] [--series N] [--paths a,b]
+#   wo new "<title>" [--size trivial|small|standard|large] [--area A] [--series N | --number N] [--paths a,b]
+#   wo new [options] -- "<title>"      (a title that starts with a dash)
 #   wo adopt <file.md> --number N [--status migrated]   bring an existing record in, recorded and never verified
 #   wo suite <number> [--wrap '<cmd>']   scaffold a suite, or wrap the runner the project already has
 #                    [--priority P0|P1|P2|P3] [--sdk] [--ui]
@@ -16,7 +17,8 @@
 #   wo list [--open|--active|--closed]   (--active: everything not closed)
 #   wo show <number>                 print the work order's primary document
 #   wo status <number>               which documents exist, which are missing
-#   wo start <number>                mark in progress
+#   wo start <number>                mark in progress; in git, make its branch and worktree
+#                                    (its documents committed first; a closed order is refused)
 #   wo block <number> "<reason>"     mark blocked
 #   wo note <number> "<text>"        append a dated session note
 #   wo suite <number>                       scaffold a behavioural suite for the work order
@@ -24,7 +26,8 @@
 #   wo verify <number> [--run <suite.sh>]   create the VERIFICATION document;
 #                                    with --run, execute the suite and record
 #                                    EXECUTED — PASS/FAIL from its exit code
-#   wo close <number>
+#   wo close <number>                draft the closeout; in git, refused while its branch is not
+#                                    merged (ALLOW_UNMERGED=1 with a reason overrides)
 #   wo promote <number> [--playbook <name>] [--allow-unsanitized]
 #   wo stats                         cycle time, evidence rate, drift
 #
@@ -74,25 +77,47 @@ else
   WORKORDERS_DIR="${WORKORDERS_DIR:-Workspace/Docs/WorkOrders}"
   WO_DIR="$PROJECT_ROOT/$WORKORDERS_DIR"
 fi
-# PACKS_DIR was the name before 1.4.0 and is still honoured when set. An install
-# that has not been migrated yet still keeps its content under packs/.
-if [ -n "${PLAYBOOKS_DIR:-}" ]; then :
-elif [ -n "${PACKS_DIR:-}" ]; then PLAYBOOKS_DIR="$PACKS_DIR"
-elif [ ! -d "$PIPELINE_ROOT/playbooks" ] && [ -d "$PIPELINE_ROOT/packs" ]; then PLAYBOOKS_DIR="$PIPELINE_ROOT/packs"
-else PLAYBOOKS_DIR="$PIPELINE_ROOT/playbooks"
-fi
 PROJECT_SLUG="${PROJECT_SLUG:-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g')}"
+# The product's code, relative to PROJECT_ROOT like every *_DIR; "." is the whole project, as before CODE_DIR
+# existed. It reaches git pathspecs and find, so it is checked as data before any use: the raw value before it
+# is normalised (so "/" cannot become "."), the normalised one after.
+CODE_DIR="${CODE_DIR:-.}"; code_dir_raw="$CODE_DIR"
+case "$CODE_DIR" in /*|-*|:*|*[*?[\\]*|*$'\n'*|*$'\r'*) CODE_DIR="";; esac
+if [ -n "$CODE_DIR" ]; then
+  CODE_DIR="${CODE_DIR#./}"; while [ "${CODE_DIR%/}" != "$CODE_DIR" ]; do CODE_DIR="${CODE_DIR%/}"; done; [ -n "$CODE_DIR" ] || CODE_DIR=.
+  case "$CODE_DIR" in ..|../*|*/..|*/../*|*//*|*/./*|*/.|./*) CODE_DIR="";; esac
+fi
+[ -n "$CODE_DIR" ] || { printf '%s: CODE_DIR in pipeline.config.sh or the environment must be a folder inside the project, written relative to it (got: %q)\n' "wo" "$code_dir_raw" >&2; exit 1; }
 
 die() { echo "wo: $*" >&2; exit 1; }
-slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//'; }
+slugify() { # a title with no letter or digit a folder name can hold (all of it in another script) is "untitled"
+  local s; s="$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$//')"; echo "${s:-untitled}"
+}
 
 meta_get() { # dir key -> value
   [ -f "$1/.wo-meta" ] && sed -n "s/^$2=//p" "$1/.wo-meta" | head -1 || true
 }
+make_artifacts() { # order folder -> its artifacts/, for working files; a link or a file there is left for doctor and promote to name
+  [ -L "$1/artifacts" ] && return 0; [ ! -e "$1/artifacts" ] || [ -d "$1/artifacts" ] || return 0
+  mkdir -p "$1/artifacts"
+}
+order_ignore() { # [--dry-run] -> the work-order folder's own .gitignore keeps every order's artifacts/ out of git; refused, nothing goes on
+  python3 "$(dirname "$CHECK")/order-ignore.py" "$WO_DIR" "$@" || die "refusing: the .gitignore that keeps order working files out of git could not be kept (above); nothing was written"
+}
+order_report() { # order folder -> what the structure rule will name in it, as it stands on disk
+  local lp; lp="$(dirname "$CHECK")/layout.py"; [ -f "$lp" ] || return 0
+  python3 "$lp" --order "$1" 2>/dev/null || true
+}
+say_kept() { # report lines -> said, before an order folder is adopted as it is
+  [ -n "$1" ] || return 0
+  echo "kept as they are, and acp doctor will name them (move each into the order's artifacts/, or delete it):"
+  printf '%s\n' "$1" | sed 's/^structure /    /'
+}
 meta_set() { # dir key value
   local f="$1/.wo-meta"; touch "$f"
   if grep -q "^$2=" "$f"; then
-    perl -pi -e "s/^\Q$2\E=.*/$2=$3/" "$f"
+    # The key and the value go in as data (register D-2): a value holding / $ @ \ or perl code is written as typed.
+    ACP_M_KEY="$2" ACP_M_VAL="$3" perl -C0 -pi -e 's/^\Q$ENV{ACP_M_KEY}\E=.*/$ENV{ACP_M_KEY}=$ENV{ACP_M_VAL}/' "$f"
   else
     printf '%s=%s\n' "$2" "$3" >> "$f"
   fi
@@ -151,37 +176,51 @@ with_id_lock() { # <command...> — serialise identity allocation across process
     sleep 0.1 2>/dev/null || sleep 1
   done
   # die() inside the protected section exits the script; the lock must not outlive it.
-  trap 'rm -rf "$lock" 2>/dev/null || true' EXIT
+  # The caller may hold its own EXIT trap: keep it running at exit with the script's exit status in $?, and put it back afterwards.
+  local prev_trap prev_cmd="" lock_q; prev_trap="$(trap -p EXIT)"
+  if [ -n "$prev_trap" ]; then prev_cmd="$(eval "set -- $prev_trap"; printf '%q' "$3")"; else prev_cmd="''"; fi
+  lock_q="$(printf '%q' "$lock")"
+  trap '_acp_rc=$?; rm -rf '"$lock_q"' 2>/dev/null || true; if [ "$_acp_rc" -eq 0 ]; then eval '"$prev_cmd"'; else (exit "$_acp_rc") || eval '"$prev_cmd"'; fi' EXIT
   "$@" || rc=$?
-  trap - EXIT
+  if [ -n "$prev_trap" ]; then eval "$prev_trap"; else trap - EXIT; fi
   rm -rf "$lock" 2>/dev/null || true
   return $rc
 }
 
 next_number() { # [series]
-  local series="${1:-}" max=0 n
+  # A series is a band, not a prefix, as in bin/bug: 0100 means 0100-0199. Matching it as a literal
+  # prefix of the four-digit number never found the band's first order, so every second order in a
+  # series was handed a number that already existed; and series 0 matched every number.
+  local series="${1:-}" max=-1 n base top cand
+  if [ -n "$series" ]; then base="$((10#$series))"; top="$(( (base / 100) * 100 + 99 ))"; fi
   for d in "$WO_DIR"/WO-*; do
     [ -d "$d" ] || continue
     n="$(basename "$d")"; n="${n#WO-}"; n="${n%%-*}"
     case "$n" in ''|*[!0-9]*) continue;; esac
     if [ -n "$series" ]; then
-      [ "${n:0:${#series}}" = "$series" ] || continue
+      [ "$((10#$n))" -ge "$base" ] && [ "$((10#$n))" -le "$top" ] || continue
     fi
     [ "$((10#$n))" -gt "$max" ] && max="$((10#$n))"
   done
-  if [ "$max" -eq 0 ] && [ -n "$series" ]; then
-    printf '%04d' "$((10#$series))"
-  else
-    printf '%04d' "$((max + 1))"
+  if [ "$max" -lt 0 ] && [ -n "$series" ]; then cand="$base"; else cand="$((max + 1))"; fi
+  [ "$cand" -gt 0 ] || cand=1   # numbers start at 0001
+  if [ -n "$series" ] && [ "$cand" -gt "$top" ]; then
+    die "series $series is full ($base-$top); open this one in another series"
   fi
+  printf '%04d' "$cand"
 }
 
 render() { # template dest number title priority
-  sed -e "s/WO-XXXX/WO-$3/g" \
-      -e "s/\[Title\]/$4/g" \
-      -e "s/YYYY-MM-DD/$(date +%F)/g" \
-      -e "s/^\*\*Priority:\*\* .*/**Priority:** $5/" \
-      "$1" > "$2"
+  # The values go in as data: perl reads them from the environment and puts them in literally, in one
+  # pass, so no title can change the substitution or expand a placeholder it contains (register E2, E25).
+  # A missing or unreadable template is refused before anything is written: perl only warns "Can't open"
+  # and exits 0, so the empty document was kept and the order reported made.
+  [ -f "$1" ] && [ -r "$1" ] || die "template missing or unreadable: $1"
+  ACP_R_NUM="$3" ACP_R_TITLE="$4" ACP_R_PRIO="${5-}" ACP_R_DATE="$(date +%F)" perl -C0 -pe '
+    BEGIN { %v = ("WO-XXXX" => "WO-$ENV{ACP_R_NUM}", "[Title]" => $ENV{ACP_R_TITLE}, "YYYY-MM-DD" => $ENV{ACP_R_DATE}) }
+    s/(WO-XXXX|\[Title\]|YYYY-MM-DD)/$v{$1}/g;
+    s/^\*\*Priority:\*\* .*/**Priority:** $ENV{ACP_R_PRIO}/;
+  ' "$1" > "$2"
 }
 
 delegation() { # area -> "primary|backup|validator"  (the orchestrator's table)
@@ -209,17 +248,31 @@ resolve_specialists() { # BACKEND / UI / DATA tokens -> the detected stack's age
   be="$("$PIPELINE_ROOT/bin/stack-specialist" backend "$PROJECT_ROOT" 2>/dev/null || echo rest-expert)"
   ui="$("$PIPELINE_ROOT/bin/stack-specialist" ui "$PROJECT_ROOT" 2>/dev/null || echo react-expert)"
   da="$("$PIPELINE_ROOT/bin/stack-specialist" data "$PROJECT_ROOT" 2>/dev/null || echo postgres-expert)"
-  printf '%s' "$1" | sed -e "s/BACKEND/$be/g" -e "s/^UI|/$ui|/" -e "s/|UI|/|$ui|/" -e "s/|UI\$/|$ui/" -e "s/DATA/$da/g"
+  # An agent name is lower-case letters, digits and - (spelled out: a range like a-z also matches other
+  # letters in some locales); anything else falls back to the default. The names replace whole fields,
+  # as data, never as sed program text.
+  case "$be" in ""|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) be=rest-expert;; esac
+  case "$ui" in ""|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) ui=react-expert;; esac
+  case "$da" in ""|*[!abcdefghijklmnopqrstuvwxyz0123456789-]*) da=postgres-expert;; esac
+  local out="" t rest="$1|"
+  while [ -n "$rest" ]; do
+    t="${rest%%|*}"; rest="${rest#*|}"
+    case "$t" in BACKEND) t="$be";; UI) t="$ui";; DATA) t="$da";; esac
+    out="$out${out:+|}$t"
+  done
+  printf '%s' "$out"
 }
 
 cmd_new() {
-  local title="" series="" priority="P2" want_sdk=0 want_ui=0 size="standard" area="" paths=""
+  local title="" series="" exact="" priority="P2" want_sdk=0 want_ui=0 size="standard" area="" paths=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --area)     area="$2"; shift 2;;
       --paths)    paths="$2"; shift 2;;
       --size)     size="$2"; shift 2;;
       --series)   series="$2"; shift 2;;
+      --number)   [ -n "${2-}" ] || die "wo new: --number must be 1 to 4 digits"; exact="$2"; shift 2;;   # exactly this number, or refuse
+      --)         shift; [ $# -eq 1 ] || die "wo new: give exactly one title after --"; title="$1"; shift;;   # the title, even one starting with a dash
       --priority) priority="$2"; shift 2;;
       --sdk)      want_sdk=1; shift;;
       --ui)       want_ui=1; shift;;
@@ -228,6 +281,13 @@ cmd_new() {
     esac
   done
   case "$size" in trivial|small|standard|large) ;; *) die "size must be trivial, small, standard, or large";; esac
+  # a number from the command line is 1 to 4 digits before any arithmetic sees it
+  case "$series" in "") ;; *[!0-9]*|?????*) die "wo new: --series must be 1 to 4 digits";; esac
+  case "$priority" in P0|P1|P2|P3) ;; *) die "wo new: --priority must be P0, P1, P2 or P3";; esac   # one line, an allowed value
+  local owner; owner="$(git config user.name 2>/dev/null || whoami)"; owner="$(printf '%s' "$owner" | LC_ALL=C tr -d '\000-\037\177')"   # one line, whatever git holds
+  case "$exact" in "") ;; *[!0-9]*|?????*) die "wo new: --number must be 1 to 4 digits";; esac   # 1 to 4 digits before any arithmetic sees it
+  [ -z "$exact" ] || [ "$((10#$exact))" -gt 0 ] || die "wo new: --number must not be 0"
+  [ -z "$exact" ] || [ -z "$series" ] || die "wo new: give --number or --series, not both"
   local primary="" backup="" validator=""
   if [ -n "$area" ]; then
     local deleg; deleg="$(delegation "$area")" || die "unknown area '$area' — backend api database auth rbac frontend ui styling testing cicd docker security performance docs analysis integration"
@@ -235,14 +295,22 @@ cmd_new() {
     primary="${deleg%%|*}"; backup="$(printf '%s' "$deleg" | cut -d'|' -f2)"; validator="${deleg##*|}"
     case "$area" in ui|frontend) [ "$size" != trivial ] && want_ui=1;; esac
   fi
+  # A title is one line of text, short enough for a folder name: a trailing carriage return is
+  # dropped, any other control character (a newline, a tab) is refused.
+  title="${title%$'\r'}"
+  case "$title" in *[[:cntrl:]]*) die "wo new: the title holds a newline, tab or other control character; give it on one line";; esac
+  [ "$(printf '%s' "$title" | LC_ALL=C wc -c | tr -d ' ')" -le 200 ] || die "wo new: the title is longer than 200 bytes; the most is 200, since it names the folder"
   [ -n "$title" ] || die 'usage: wo new "<title>" [--size S] [--series N] [--priority P0|P1|P2|P3] [--sdk] [--ui]'
-  mkdir -p "$WO_DIR"
+  mkdir -p "$WO_DIR"; order_ignore
   # Choosing a number and taking it have to be one operation. Scanning first and
   # creating afterwards lets four simultaneous creators all read the same maximum
   # and all believe they own WO-0001.
   local num dir
   reserve_number() {
-    num="$(next_number "$series")"
+    if [ -n "$exact" ]; then   # exactly as asked, or refused: never moved to another number
+      num="$(printf '%04d' "$((10#$exact))")"
+      [ -z "$(find "$WO_DIR" -maxdepth 1 -type d -name "WO-$num-*" -print -quit 2>/dev/null)" ] || die "WO-$num already exists"
+    else num="$(next_number "$series")" || exit 1; fi   # a full band refuses; nothing is made
     dir="$WO_DIR/WO-$num-$(slugify "$title")"
     [ -e "$dir" ] && die "$dir already exists"
     [ -n "$(find "$WO_DIR" -maxdepth 1 -type d -name "WO-$num-*" -print -quit 2>/dev/null)" ] \
@@ -250,8 +318,10 @@ cmd_new() {
     mkdir -p "$dir"
   }
   with_id_lock reserve_number
+  # Until it is whole, a failure removes the folder just reserved, so no half-made folder holds the number.
+  _acp_half="$dir"; trap '_acp_rc=$?; [ -z "${_acp_half:-}" ] || rm -rf "$_acp_half"; exit "$_acp_rc"' EXIT
 
-  printf 'size=%s\ntitle=%s\npriority=%s\ncreated=%s\nowner=%s\n' "$size" "$title" "$priority" "$(date +%F)" "$(git config user.name 2>/dev/null || whoami)" > "$dir/.wo-meta"
+  printf 'size=%s\ntitle=%s\npriority=%s\ncreated=%s\nowner=%s\n' "$size" "$title" "$priority" "$(date +%F)" "$owner" > "$dir/.wo-meta"
   [ -n "$area" ] && printf 'area=%s\nprimary=%s\nbackup=%s\nvalidator=%s\n' "$area" "$primary" "$backup" "$validator" >> "$dir/.wo-meta"
   # Evidence is bound to the source it ran against. In a monorepo "the source" is
   # the part this work order touches, or unrelated commits invalidate its evidence.
@@ -259,6 +329,7 @@ cmd_new() {
   # Snapshot the tree now, so the work order can name its own changes at close
   # time with or without git. It lives in the folder, which the fingerprint skips.
   write_manifest "$dir/.wo-manifest" "$paths"
+  make_artifacts "$dir" || die "wo new: could not make $dir/artifacts"
   for k in $(required_docs "$size"); do
     case "$k" in
       MAIN)               render "$TEMPLATES/WO-TEMPLATE-MAIN.md"               "$dir/WO-$num-$(slugify "$title").md" "$num" "$title" "$priority";;
@@ -286,6 +357,7 @@ p.write_text(first + "\n" + block + "\n" + rest)
 PYEOF
   fi
   [ -n "$area" ] && write_specialists "$dir" "$num" "$primary" "$backup" "$validator"
+  _acp_half=""; trap - EXIT   # whole: the folder stays
   echo "WO-$num created ($size): $dir"
   ls "$dir" | sed 's/^/    /'
   if [ -n "$area" ]; then echo; echo "Delegation ($area):"; echo "  implement with : $primary"; echo "  backup         : $backup"; echo "  validate with  : $validator"; fi
@@ -306,7 +378,11 @@ doc_state() { # dir number -> prints markers
 evidence_summary() { # dir number -> PASS 42/43 | FAIL 12/15 | PRECOND | PLAN | RUNNING | -
   local v="$1/WO-$2-VERIFICATION.md"; [ -f "$v" ] || { echo "-"; return; }
   local st; st="$(latest_status "$v")"
-  local ratio; ratio="$(grep -m1 -oE 'checks [0-9]+/[0-9]+' "$v" | cut -d' ' -f2 || true)"
+  # The ratio is the status line's own ending, ", checks P/T)", which the writer puts last; a
+  # "checks N/M" anywhere else on the line (in the suite path) or in the file is not it.
+  local line ratio=""; line="$(grep -m1 -E '^\*\*Overall status:\*\*' "$v" || true)"; line="${line%$'\r'}"
+  case "$line" in *", checks "*")") ratio="${line##*, checks }"; ratio="${ratio%)}";; esac
+  case "$ratio" in [0-9]*/[0-9]*) case "$ratio" in *[!0-9/]*|*/*/*) ratio="";; esac;; *) ratio="";; esac
   case "$st" in none) echo "-";; *) echo "$st${ratio:+ $ratio}";; esac
 }
 cmd_list() {
@@ -348,25 +424,71 @@ cmd_adopt() { # <file> --number N [--title T] [--status migrated] [--opened YYYY
   done
   [ -n "$file" ] && [ -f "$file" ] || die 'usage: wo adopt <file.md> --number N [--title T] [--status migrated|open] [--opened YYYY-MM-DD] [--size small] [--dry-run]'
   [ -n "$num" ] || die "wo adopt: --number is required; adopted work keeps the number its record already cites"
+  case "$num" in ""|*[!0-9]*|?????*) die "wo adopt: --number must be digits (1 to 4 digits)";; esac
   num="$(printf '%04d' "$((10#$num))")"
   case "$size" in trivial|small|standard|large) ;; *) die "size must be trivial, small, standard, or large";; esac
   case "$status" in migrated|adopted|open|in-progress|blocked) ;; *) die "status must be migrated, adopted, open, in-progress, or blocked";; esac
-  [ -z "$title" ] && title="$(grep -m1 -E '^# ' "$file" | sed 's/^# *//' | cut -c1-80)"
+  # every value written into .wo-meta is one line and an allowed value
+  case "$opened" in ""|[0123456789][0123456789][0123456789][0123456789]-[0123456789][0123456789]-[0123456789][0123456789]) ;; *) die "wo adopt: --opened must be a date, YYYY-MM-DD";; esac
+  case "$file" in *[[:cntrl:]]*) die "wo adopt: the record's path holds a newline, tab or other control character";; esac
+  local owner; owner="$(git config user.name 2>/dev/null || whoami)"; owner="$(printf '%s' "$owner" | LC_ALL=C tr -d '\000-\037\177')"   # one line, whatever git holds
+  if [ -z "$title" ]; then
+    # the record's own heading: its first 80 characters, then whole characters dropped until it fits 200 bytes. GNU cut -c
+    # counts bytes and ${x%?} follows the locale, so neither keeps a character boundary everywhere; this does
+    title="$(grep -m1 -E '^# ' "$file" | sed 's/^# *//' | python3 -I -c 'import sys
+t = sys.stdin.buffer.read().split(b"\n")[0].decode("utf-8", "surrogateescape")[:80]
+while len(t.encode("utf-8", "surrogateescape")) > 200: t = t[:-1]
+sys.stdout.buffer.write(t.encode("utf-8", "surrogateescape"))')"
+  fi
   [ -z "$title" ] && { title="$(basename "$file" .md)"; }
+  # A title is one line of text, short enough for a folder name: a trailing carriage return is
+  # dropped, any other control character (a newline, a tab) is refused.
+  title="${title%$'\r'}"
+  [ -z "$title" ] && title="$(basename "$file" .md)"
+  case "$title" in *[[:cntrl:]]*) die "wo adopt: the title holds a newline, tab or other control character; give it on one line";; esac
+  [ "$(printf '%s' "$title" | LC_ALL=C wc -c | tr -d ' ')" -le 200 ] || die "wo adopt: the title is longer than 200 bytes; the most is 200, since it names the folder"
   # A record that already sits in a WO-N folder under the work-order directory is
   # adopted where it is: the folder keeps its name and contents, and only the
   # metadata that makes it the pipeline's is added.
   local fdir; fdir="$(cd "$(dirname "$file")" && pwd -P)"
   case "$fdir" in "$WO_DIR"/WO-"$num"-*)
     [ -f "$fdir/.wo-meta" ] && die "WO-$num is already the pipeline's (it carries .wo-meta)"
-    if [ "$dry" -eq 1 ]; then printf 'would adopt in place  %s\n             status  %s   size %s\n' "${fdir#$PROJECT_ROOT/}" "$status" "$size"; return 0; fi
+    # The record is filed under the order's document name, unless it already is one of the order's own;
+    # everything else in the folder is kept as it is, and said.
+    local rep rec="${file##*/}" fb="${fdir##*/}" target=""; rep="$(order_report "$fdir")"
+    case "$rep" in *"structure $fb/$rec: "*)
+      case "$size" in trivial) target="WO-$num-$(slugify "$title").md";; *) target="WO-$num-SPEC.md";; esac
+      { [ ! -e "$fdir/$target" ] && [ ! -L "$fdir/$target" ]; } || die "refusing to adopt WO-$num in place: $rec would be filed as $target, which is taken; nothing was written";;
+    esac
+    rep="$(printf '%s\n' "$rep" | { grep -vF "structure $fb/$rec: " || true; })"
+    if [ "$dry" -eq 1 ]; then
+      printf 'would adopt in place  %s\n             status  %s   size %s\n' "${fdir#$PROJECT_ROOT/}" "$status" "$size"
+      [ -z "$target" ] || printf '        would file  %s as %s\n' "$rec" "$target"
+      order_ignore --dry-run; say_kept "$rep"; return 0
+    fi
+    order_ignore; say_kept "$rep"
+    if [ -n "$target" ]; then   # git mv when git tracks it, so its history follows
+      if git -C "$fdir" ls-files --error-unmatch -- "$rec" >/dev/null 2>&1; then git -C "$fdir" mv -- "$rec" "$target" || die "wo adopt: git could not file $rec as $target"
+      else mv -- "$fdir/$rec" "$fdir/$target" || die "wo adopt: could not file $rec as $target"; fi
+      echo "filed $rec as $target"
+    fi
     printf 'size=%s\ntitle=%s\npriority=P2\ncreated=%s\nadopted=%s\nadopted_from=%s\nowner=%s\nstatus=%s\n' \
-      "$size" "$title" "${opened:-$(date +%F)}" "$(date +%F)" "$file" "$(git config user.name 2>/dev/null || whoami)" "$status" > "$fdir/.wo-meta"
+      "$size" "$title" "${opened:-$(date +%F)}" "$(date +%F)" "$file" "$owner" "$status" > "$fdir/.wo-meta"
+    make_artifacts "$fdir" || die "wo adopt: could not make $fdir/artifacts"
     echo "WO-$num adopted in place ($status): ${fdir#$PROJECT_ROOT/}"
     echo "No verification was written. Adopted work is recorded, not verified."
     return 0;;
   esac
-  local taken; taken="$(find "$WO_DIR" -maxdepth 1 -type d -name "WO-$num-*" -print -quit 2>/dev/null)"
+  # A work-order folder that is not there yet is made below, as wo new makes it. One that cannot be read,
+  # or is not a folder, is refused, so the one-number check above a new folder never goes unasked.
+  local taken=""
+  if [ -d "$WO_DIR" ]; then
+    taken="$(find "$WO_DIR" -maxdepth 1 -type d -name "WO-$num-*" -print -quit 2>/dev/null)" || die "wo adopt: cannot read the work-order folder ${WO_DIR#"$PROJECT_ROOT"/}"
+  elif [ -e "$WO_DIR" ]; then
+    die "wo adopt: the work-order folder ${WO_DIR#"$PROJECT_ROOT"/} is not a folder"
+  else
+    echo "wo adopt: the work-order folder ${WO_DIR#"$PROJECT_ROOT"/} does not exist yet; adopting creates it"
+  fi
   [ -z "$taken" ] || die "WO-$num already exists: $taken. Two records cannot share a number. To adopt that folder as it is, name a file inside it."
   local dir="$WO_DIR/WO-$num-$(slugify "$title")" doc
   case "$size" in trivial) doc="$dir/WO-$num-$(slugify "$title").md";; *) doc="$dir/WO-$num-SPEC.md";; esac
@@ -374,12 +496,16 @@ cmd_adopt() { # <file> --number N [--title T] [--status migrated] [--opened YYYY
     printf 'would adopt  %s\n         as  %s\n     status  %s   size %s   opened %s\n' "$file" "${doc#$PROJECT_ROOT/}" "$status" "$size" "${opened:-$(date +%F)}"
     return 0
   fi
-  mkdir -p "$WO_DIR"
+  mkdir -p "$WO_DIR"; order_ignore
   reserve_number() { [ -e "$dir" ] && die "$dir already exists"; mkdir -p "$dir"; }
   with_id_lock reserve_number
+  # Until it is whole, a failure removes the folder just reserved, so no half-made folder holds the number.
+  _acp_half="$dir"; trap '_acp_rc=$?; [ -z "${_acp_half:-}" ] || rm -rf "$_acp_half"; exit "$_acp_rc"' EXIT
   cp "$file" "$doc"
   printf 'size=%s\ntitle=%s\npriority=P2\ncreated=%s\nadopted=%s\nadopted_from=%s\nowner=%s\nstatus=%s\n' \
-    "$size" "$title" "${opened:-$(date +%F)}" "$(date +%F)" "$file" "$(git config user.name 2>/dev/null || whoami)" "$status" > "$dir/.wo-meta"
+    "$size" "$title" "${opened:-$(date +%F)}" "$(date +%F)" "$file" "$owner" "$status" > "$dir/.wo-meta"
+  make_artifacts "$dir" || die "wo adopt: could not make $dir/artifacts"
+  _acp_half=""; trap - EXIT   # whole: the folder stays
   echo "WO-$num adopted ($status): ${dir#$PROJECT_ROOT/}"
   echo "    ${doc#$dir/}   (the original record, unchanged)"
   echo "No verification was written. Adopted work is recorded, not verified: when the work is"
@@ -416,6 +542,7 @@ cmd_status() {
 
 cmd_close() {
   local n="$1"; [ -n "$n" ] || die "usage: wo close <number>"
+  not_in_worktree close "$n"
   local d; d="$(wo_folder "$n")"; [ -n "$d" ] || die "no work order WO-$n under $WO_DIR"
   export WO_PATHS; WO_PATHS="$(meta_get "$d" paths)"
   ls "$d" | grep -qi -- "WO-$n-VERIFICATION" \
@@ -438,8 +565,9 @@ cmd_close() {
     sections with what actually ran, or pass ALLOW_PLACEHOLDERS=1 if they are genuinely N/A."
   fi
   local recorded; recorded="$(grep -m1 -oE 'tree [0-9a-f]{16}' "$vfile" | cut -d' ' -f2 || true)"
-  if [ -n "$recorded" ] && [ "${ALLOW_STALE:-0}" != 1 ] && [ "$recorded" != "$(tree_fingerprint)" ]; then
-    die "refusing to close WO-$n: the source changed after the last PASS (tree $recorded then, $(tree_fingerprint) now).
+  local now=""; [ -z "$recorded" ] || [ "${ALLOW_STALE:-0}" = 1 ] || now="$(tree_fingerprint)"   # once: it names an unreadable file once
+  if [ -n "$now" ] && [ "$recorded" != "$now" ]; then
+    die "refusing to close WO-$n: the source changed after the last PASS (tree $recorded then, $now now).
     Evidence is bound to the source it ran against. Re-run:  wo verify $n --run <suite.sh>   (ALLOW_STALE=1 to override)
     Committing does not change the fingerprint; editing, formatting, or a teammate's change inside the tree does."
   fi
@@ -469,9 +597,14 @@ cmd_close() {
     A review nobody wrote is not a review. Fill it in, or ACP_SKIP_REVIEW=1 with a reason in the closeout."
     fi;;
   esac
+  # The evidence covers the work only once it is in the main checkout: while the order's branch holds commits
+  # its HEAD lacks, nothing is closed (ALLOW_UNMERGED=1, with a reason in the closeout, closes it anyway).
+  unmerged_guard "$d" "$n"
   # The rules, over what this work order changed. Under Claude Code the session hooks
   # already said most of this as it happened; here it is said again where it counts,
   # and under any other tool this is the first time it is said at all.
+  # A missing check.py is a refusal, never a silent skip: without it no rule ran at all.
+  [ "${ACP_SKIP_CHECK:-0}" = 1 ] || [ -f "$CHECK" ] || die "refusing to close WO-$n: the close-time checks are missing ($CHECK not found), so none ran. Reinstall the pipeline, or ACP_SKIP_CHECK=1 with a reason in the closeout."
   if [ -f "$CHECK" ] && [ "${ACP_SKIP_CHECK:-0}" != 1 ]; then
     local crc=0 conly=()
     [ -n "${WO_PATHS:-}" ] && IFS=, read -r -a conly <<< "$WO_PATHS"
@@ -482,12 +615,21 @@ cmd_close() {
     else
       echo "wo: WO-$n predates the manifest and there is no git; the close-time checks were not run" >&2
     fi
-    [ "$crc" -ne 2 ] || die "refusing to close WO-$n: the checks above block. Fix them, or ACP_SKIP_CHECK=1 with a reason in the closeout."
+    # check.py exits 0 when nothing blocks and 2 when something does. Any other exit (1: the checks could not
+    # start, 3: they broke part-way, 127: no python3, or a signal) means they did not run to the end, so
+    # nothing may be taken as passed.
+    case "$crc" in
+      0)   ;;
+      2)   die "refusing to close WO-$n: the checks above block. Fix them, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+      3)   die "refusing to close WO-$n: the close-time checks broke part-way (check.py exit 3), so they did not run to the end. Fix what the message above names, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+      127) die "refusing to close WO-$n: the close-time checks could not start (exit 127: python3 not found). Make python3 available, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+      *)   die "refusing to close WO-$n: the close-time checks did not finish (check.py exit $crc), so nothing may be taken as passed. Fix what the message above names, or ACP_SKIP_CHECK=1 with a reason in the closeout.";;
+    esac
   fi
   # The knowledge base describes the code. A change to code a profile cites makes
   # that profile a claim about something that no longer exists; the tool cannot
   # rewrite it, but it can say so here, where the work is still in mind.
-  KB_IMPACT=""
+  KB_IMPACT=""; KB_GROW=""
   local kbd="$PROJECT_ROOT/${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}" kbpy="$PIPELINE_ROOT/core/hooks/kb.py"
   if [ -d "$kbd" ] && [ -f "$kbpy" ] && [ -f "$d/.wo-manifest" ] && [ -f "$CHECK" ]; then
     local changed; changed="$(cd "$PROJECT_ROOT" && python3 "$CHECK" --root "$PROJECT_ROOT" --manifest "$d/.wo-manifest" --exclude $(fingerprint_excludes | tr '\n' ' ') --list 2>/dev/null || true)"
@@ -502,20 +644,62 @@ cmd_close() {
         echo "    Update them before the next reader trusts them, then:  acp kb bind" >&2
       fi
     fi
-    # New code with no profile gets a stub now, cited and bound, so the knowledge
-    # base grows with the work; the stale rows above are left exactly as they are.
+    # New code no profile covers gets a stub now, cited and bound, so the knowledge
+    # base grows with the work. Grow changes no existing profile; the stale rows above
+    # are left exactly as they are. Every line it prints is shown and recorded under its
+    # own heading in the closeout, its errors included. kb.py exits 3 when a profile's
+    # covered paths are gone; under the strict profile that refuses the close, decided by
+    # a report-only run (--check) first, so a refused close leaves nothing new on disk.
     if python3 "$kbpy" scaffold --help 2>/dev/null | grep -q -- '--grow'; then
-      local grown; grown="$(cd "$PROJECT_ROOT" && python3 "$kbpy" scaffold --grow --root "$PROJECT_ROOT" --kb "$kbd" --pipeline-dir "${PIPELINE_ROOT#$PROJECT_ROOT/}" 2>/dev/null | tail -1 || true)"
-      case "$grown" in *"profiles added"*) echo "Knowledge base: $grown — their narrative is owed; the profiles say what to write." >&2; KB_IMPACT="${KB_IMPACT:+$KB_IMPACT
-}$grown";; esac
+      kb_grow() { ( cd "$PROJECT_ROOT" && python3 "$kbpy" scaffold --grow "$@" --root "$PROJECT_ROOT" --kb "$kbd" --pipeline-dir "${PIPELINE_ROOT#$PROJECT_ROOT/}" 2>&1 ); }
+      local grown grc=0 strict_kb=0 shown
+      [ "${ACP_STRICT:-0}" = 1 ] && [ "${ACP_SKIP_KB:-0}" != 1 ] && strict_kb=1
+      if [ "$strict_kb" = 1 ]; then
+        grown="$(kb_grow --check)" || grc=$?
+        if [ "$grc" -eq 3 ]; then
+          echo "Knowledge base (report only, nothing was written):" >&2
+          printf '%s\n' "$grown" | sed 's/^grow: //; s/^/    /' >&2
+          die "refusing to close WO-$n under the strict profile: a profile covers paths that are gone (listed above).
+    Update or retire it, then  acp kb bind  ; for a profile the scaffold wrote,  acp kb scaffold  marks it orphaned.
+    Or ACP_SKIP_KB=1 with a reason in the closeout."
+        fi
+        grc=0
+      fi
+      grown="$(kb_grow)" || grc=$?
+      case "$grc" in
+        0|3)
+          shown="$(printf '%s\n' "$grown" | { grep -v -e '^grow: nothing new$' -e '^$' || true; } | sed 's/^grow: //')"
+          if [ -n "$shown" ]; then
+            echo "Knowledge base:" >&2
+            printf '%s\n' "$shown" | sed 's/^/    /' >&2
+            case "$shown" in *"profiles added"*) echo "    A new profile is a stub: its narrative is owed, and the profile says what to write." >&2;; esac
+            KB_GROW="$shown"
+            if [ "$grc" -eq 3 ] && [ "${ACP_STRICT:-0}" = 1 ] && [ "${ACP_SKIP_KB:-0}" = 1 ]; then
+              KB_GROW="$KB_GROW
+The strict profile refuses a close while a profile covers paths that are gone; it was overridden with ACP_SKIP_KB=1. Give the reason here."
+            fi
+          fi;;
+        *)
+          echo "Knowledge base: the grow step failed (exit $grc); its output:" >&2
+          printf '%s\n' "$grown" | sed 's/^/    /' >&2
+          KB_GROW="the grow step failed (exit $grc); its output:
+$grown";;
+      esac
     fi
   fi
   local out="$d/WO-$n-CLOSEOUT.md"
   [ -e "$out" ] && die "$out already exists"
   local title; title="$(basename "$d")"; title="${title#WO-$n-}"
   render "$(ctemplate "$area")" "$out" "$n" "$title" "P2"
-  if [ -n "${KB_IMPACT:-}" ]; then
-    { printf '\n## Knowledge Base Impact\n\nThis work order changed files the following profiles describe. They were recorded here at close; a profile that still describes the old code is a claim about something that no longer exists.\n\n```\n%s\n```\n' "$KB_IMPACT"; } >> "$out"
+  meta_set "$d" status closed   # what the CLOSEOUT says, in the meta too; wo start's in-progress does not outlive the close
+  if [ -n "${KB_IMPACT:-}" ] || [ -n "${KB_GROW:-}" ]; then
+    printf '\n## Knowledge Base Impact\n' >> "$out"
+    if [ -n "${KB_IMPACT:-}" ]; then
+      { printf '\nThis work order changed files the following profiles describe. They were recorded here at close; a profile that still describes the old code is a claim about something that no longer exists.\n\n```\n%s\n```\n' "$KB_IMPACT"; } >> "$out"
+    fi
+    if [ -n "${KB_GROW:-}" ]; then
+      { printf '\n### Knowledge base changes at close\n\nWhat the grow step (`kb.py scaffold --grow`) reported when this work order closed. It adds a stub profile for code no profile covers and changes no existing profile.\n\n```\n%s\n```\n' "$KB_GROW"; } >> "$out"
+    fi
   fi
   echo "WO-$n closeout drafted: $out"
   echo "Fill it in from the verification report — do not claim results that were not executed."
@@ -524,6 +708,8 @@ cmd_close() {
   if [ -n "$inum" ] && command -v gh >/dev/null 2>&1; then
     REPO="$(gh_repo)"; [ -n "$REPO" ] && gh issue close "$inum" --repo "$REPO" --comment "Closed with executed verification. Closeout: \`$(basename "$out")\` in the repository." >/dev/null 2>&1 && echo "Issue #$inum closed."
   fi
+  # Merged work needs neither its worktree nor its branch; anything that could be lost keeps both.
+  close_worktree "$d" "$n"
 }
 
 gh_repo() { # -> owner/name or empty
@@ -563,7 +749,11 @@ cmd_publish() {
   rm -f "$body"
   case "$url" in https://*) ;; *) die "gh issue create failed: $url";; esac
   num="${url##*/}"
-  meta_set "$d" issue "$url"; meta_set "$d" issue_number "$num"
+  meta_set "$d" issue "$url"
+  # The issue number is the URL's last part and must be digits: wo sync, wo verify and wo close pass it to
+  # gh, so anything else is never recorded. The URL is kept, so the order is not published twice.
+  case "$num" in ""|*[!0-9]*) die "WO-$n: gh returned $url, whose last part is not an issue number; the URL is recorded, the number is not: add issue_number=<the issue's number> to its .wo-meta, then wo sync $n";; esac
+  meta_set "$d" issue_number "$num"
   cmd_note "$n" "Published as $url" >/dev/null
   echo "WO-$n published: $url"
 }
@@ -572,7 +762,13 @@ cmd_sync() {
   local n="${1:-}"; [ -n "$n" ] || die "usage: wo sync <number>"
   local d; d="$(wo_folder "$n")"; [ -n "$d" ] || die "no work order WO-$n"
   gh_ready
-  local num; num="$(meta_get "$d" issue_number)"; [ -n "$num" ] || die "WO-$n is not published (wo publish $n)"
+  local num; num="$(meta_get "$d" issue_number)"
+  if [ -z "$num" ]; then
+    # a publish refused for a bad URL keeps the URL but not the number: say how to recover
+    [ -n "$(meta_get "$d" issue)" ] && die "WO-$n has its issue URL recorded but no issue number: add issue_number=<the issue's number> to its .wo-meta, then wo sync $n"
+    die "WO-$n is not published (wo publish $n)"
+  fi
+  case "$num" in *[!0-9]*) die "WO-$n: the recorded issue number is not a number; correct issue_number in its .wo-meta";; esac
   local body; body="$(mktemp)"; issue_body "$d" "$n" > "$body"
   gh issue edit "$num" --repo "$REPO" --body-file "$body" >/dev/null
   rm -f "$body"
@@ -583,17 +779,25 @@ cmd_sync() {
 
 cmd_import() {
   local num="${1:-}"; [ -n "$num" ] || die "usage: wo import <issue-number> [--size S]"
+  case "$num" in *[!0-9]*|?????*) die "wo import: the issue number must be 1 to 4 digits";; esac   # before gh and any arithmetic
   shift; local size="standard"; while [ $# -gt 0 ]; do case "$1" in --size) size="$2"; shift 2;; *) shift;; esac; done
   gh_ready
   local title body url
   title="$(gh issue view "$num" --repo "$REPO" --json title -q .title)"; [ -n "$title" ] || die "issue #$num not found in $REPO"
   body="$(gh issue view "$num" --repo "$REPO" --json body -q .body)"; url="$(gh issue view "$num" --repo "$REPO" --json url -q .url)"
   title="${title#WO-[0-9]*: }"
-  cmd_new "$title" --size "$size" --series "$num" | head -1
-  local d; d="$(wo_folder "$(printf '%04d' "$((10#$num))")")"
+  # the issue's own text: cut to 200 bytes and back to the last whole UTF-8 character, whatever the locale
+  title="$(printf '%s' "$title" | python3 -I -c 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read()[:200].decode("utf-8", "ignore").encode("utf-8"))')"
+  # The issue number is taken exactly, or the import refuses. The output is captured rather than piped
+  # to head, which under pipefail ended the import before the issue was attached.
+  local n4 out; n4="$(printf '%04d' "$((10#$num))")"
+  out="$(set -e; cmd_new --size "$size" --number "$num" -- "$title")"   # set -e inside, and no ||, so a failure part-way still removes the half-made folder
+  case "$out" in "WO-$n4 created"*) ;; *) die "wo import: did not open WO-$n4; nothing was attached";; esac
+  printf '%s\n' "${out%%$'\n'*}"
+  local d; d="$(wo_folder "$n4")"
   [ -n "$d" ] || die "import created no folder"
   meta_set "$d" issue "$url"; meta_set "$d" issue_number "$num"
-  local pd; pd="$(primary_doc "$d" "$(printf '%04d' "$((10#$num))")")"
+  local pd; pd="$(primary_doc "$d" "$n4")"
   [ -n "$body" ] && printf '\n---\n\n## From issue #%s\n\n%s\n' "$num" "$body" >> "$pd"
   echo "Imported issue #$num as $(basename "$d") (numbered from the issue so the two match)"
 }
@@ -605,11 +809,166 @@ cmd_show() {
   local pd; pd="$(primary_doc "$d" "$n")"; [ -n "$pd" ] && cat "$pd" || echo "(no primary document)"
 }
 
+worktree_of() { # dir -> "branch|path relative to the project" of the order's worktree; empty when its folder name cannot name a branch
+  local tail; tail="$(basename "$1")"; tail="${tail#WO-}"
+  case "$tail" in ""|*[!0123456789abcdefghijklmnopqrstuvwxyz-]*) return 0;; esac
+  printf 'wo/%s|%s/Worktrees/wo-%s' "$tail" "${WORKSPACE_DIR:-Workspace}" "$tail"
+}
+worktree_listed() { # absolute path -> 0 when git lists it as a worktree of this repository
+  local wl; wl="$(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null || true)"
+  case "
+$wl
+" in *"
+worktree $1
+"*) return 0;; esac
+  return 1
+}
+worktree_of_branch() { # branch -> the path git lists for the worktree checked out on it, or empty
+  local line at=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) at="${line#worktree }";;
+      "branch refs/heads/$1") printf '%s' "$at"; return 0;;
+    esac
+  done <<< "$(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null || true)"
+  return 0
+}
+shq() { printf '%q' "$1"; }   # a path in advice someone pastes into a shell
+linked_main() { # -> the main checkout's path when PROJECT_ROOT is a linked worktree; empty in the main checkout or outside git
+  local gd gc
+  git -C "$PROJECT_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  gd="$(cd "$PROJECT_ROOT" && cd "$(git rev-parse --git-dir)" && pwd -P)" || return 0
+  gc="$(cd "$PROJECT_ROOT" && cd "$(git rev-parse --git-common-dir)" && pwd -P)" || return 0
+  [ "$gd" = "$gc" ] || dirname "$gc"
+}
+not_in_worktree() { # command number: an order worktree's copy of an order is not the order; refuse there
+  # Only the worktrees wo start makes (under the main checkout's Worktrees folder): a project that itself lives
+  # in a linked worktree (a session's own worktree) runs every command as before.
+  local mc; mc="$(linked_main)"; [ -n "$mc" ] || return 0
+  case "$PROJECT_ROOT/" in
+    "$mc/${WORKSPACE_DIR:-Workspace}/Worktrees/"*)
+      die "refusing to $1 WO-$2 here: this is an order's worktree, whose copy of the order is not the order; run wo $1 in the main checkout ($mc)";;
+  esac
+}
+start_worktree() { # dir number -> WT_LINE: make the order's branch and worktree, or say why there is none
+  local d="$1" n="$2" wo branch rel wt at out rd
+  WT_LINE=""
+  git -C "$PROJECT_ROOT" rev-parse --verify -q HEAD >/dev/null 2>&1 || { WT_LINE="WO-$n: no worktree: not a git repository with a commit"; return 0; }
+  [ -z "$(linked_main)" ] || { WT_LINE="WO-$n: no worktree: this is a linked worktree; run wo start in the main checkout"; return 0; }
+  wo="$(worktree_of "$d")"; [ -n "$wo" ] || die "refusing to start WO-$n: its folder name ($(basename "$d")) cannot name a branch; rename it with lower-case letters, digits and -"
+  branch="${wo%%|*}"; rel="${wo#*|}"; wt="$PROJECT_ROOT/$rel"
+  # The branch starts at HEAD, so the order's documents must be in it: otherwise its commits name an order the
+  # branch does not hold. .wo-meta is the driver's own (start writes it), so a change there is not counted.
+  rd="${d#"$PROJECT_ROOT"/}"
+  out="$(git -C "$PROJECT_ROOT" status --porcelain --untracked-files=normal -- "$rd" ":!$rd/.wo-meta" 2>&1)" \
+    || die "refusing to start WO-$n: git could not read the status of its documents: $out"
+  [ -z "$out" ] || die "refusing to start WO-$n: its documents are not committed; commit WO-$n's documents first:  git add $(shq "$rd") && git commit"
+  # A worktree moved elsewhere (git worktree move, or mv and then git worktree repair) still holds the branch.
+  at="$(worktree_of_branch "$branch")"
+  [ -z "$at" ] || [ "$at" = "$wt" ] || die "refusing to start WO-$n: its worktree is at $at; move it back with  git worktree move $(shq "$at") $(shq "$rel")"
+  # The folder ignores itself, so git never sees a worktree as a change in the main checkout.
+  mkdir -p "$(dirname "$wt")"; [ -f "$(dirname "$wt")/.gitignore" ] || printf '*\n' > "$(dirname "$wt")/.gitignore"
+  if worktree_listed "$wt"; then
+    [ -d "$wt" ] || die "refusing to start WO-$n: its worktree $rel is missing: if it was deleted, run  git worktree prune; if it was moved, run  git worktree repair <new path>, then  git worktree move <new path> $(shq "$rel")"
+  elif [ -e "$wt" ]; then die "refusing to start WO-$n: $rel exists and is not a worktree of this repository; move it away first"
+  elif git -C "$PROJECT_ROOT" show-ref --verify -q "refs/heads/$branch"; then
+    out="$(git -C "$PROJECT_ROOT" worktree add "$wt" "$branch" 2>&1)" || die "refusing to start WO-$n: git could not make its worktree: $out"
+  else
+    out="$(git -C "$PROJECT_ROOT" worktree add -b "$branch" "$wt" HEAD 2>&1)" || die "refusing to start WO-$n: git could not make its worktree: $out"
+  fi
+  meta_set "$d" branch "$branch"; meta_set "$d" worktree "$rel"
+  WT_LINE="WO-$n: worktree $wt on branch $branch
+WO-$n: work in the worktree; run wo commands (verify, close) from the main checkout, $PROJECT_ROOT"
+}
+unmerged_guard() { # dir number: refuse while the order's branch has commits the main checkout's HEAD lacks
+  local wo branch c
+  [ "${ALLOW_UNMERGED:-0}" != 1 ] || return 0
+  wo="$(worktree_of "$1")"; [ -n "$wo" ] || return 0; branch="${wo%%|*}"
+  git -C "$PROJECT_ROOT" show-ref --verify -q "refs/heads/$branch" 2>/dev/null || return 0
+  ! git -C "$PROJECT_ROOT" merge-base --is-ancestor "refs/heads/$branch" HEAD 2>/dev/null || return 0
+  c="$(git -C "$PROJECT_ROOT" rev-list --count "HEAD..refs/heads/$branch" 2>/dev/null || echo "some")"
+  die "refusing to close WO-$2: branch $branch has $c commit(s) the main checkout's HEAD does not, so the evidence does not cover them.
+    Merge $branch first:  git merge $(shq "$branch")   (ALLOW_UNMERGED=1 with a reason in the closeout to close anyway)
+    If it was squash- or rebase-merged, close with ALLOW_UNMERGED=1, then remove the worktree, and the branch with  git branch -D $(shq "$branch"), by hand."
+}
+close_worktree() { # dir number: remove the order's worktree and delete its branch only when nothing can be lost
+  local d="$1" n="$2" wo branch rel wt into at st loose e name kept=0 disp out gl sub lv fin
+  wo="$(worktree_of "$d")"; [ -n "$wo" ] || return 0
+  branch="${wo%%|*}"; rel="${wo#*|}"; wt="$PROJECT_ROOT/$rel"
+  fin="git worktree remove $(shq "$rel") && git branch -d $(shq "$branch")"
+  if ! worktree_listed "$wt"; then
+    # moved with git worktree move (or mv and git worktree repair): say where it is, and change nothing
+    at="$(worktree_of_branch "$branch")"
+    [ -z "$at" ] || echo "WO-$n: the worktree of branch $branch is at $at, not $rel; nothing removed; move it back with  git worktree move $(shq "$at") $(shq "$rel")"
+    return 0
+  fi
+  [ -d "$wt" ] || { echo "WO-$n: worktree $rel is missing (moved or deleted); nothing removed: if it was deleted, run  git worktree prune; if it was moved, run  git worktree repair <new path>, then  git worktree move <new path> $(shq "$rel")"; return 0; }
+  # A detached HEAD, or another branch, may hold commits no ref has: only the order's own branch is judged.
+  [ "$(git -C "$wt" symbolic-ref -q HEAD 2>/dev/null || true)" = "refs/heads/$branch" ] \
+    || { echo "WO-$n: worktree $rel kept: it is not on $branch (its HEAD is detached or on another branch)"; return 0; }
+  into="$(git -C "$PROJECT_ROOT" symbolic-ref -q --short HEAD 2>/dev/null || echo HEAD)"
+  if ! git -C "$PROJECT_ROOT" merge-base --is-ancestor "$(git -C "$wt" rev-parse HEAD 2>/dev/null || echo "$branch")" HEAD 2>/dev/null; then
+    echo "WO-$n: worktree $rel kept: branch $branch is not merged into $into; once it is:  $fin"
+    return 0
+  fi
+  # The flags, not the configuration, decide what is listed: status.showUntrackedFiles=no would hide every
+  # untracked file, and git worktree remove would then delete them.
+  st="$(git -C "$wt" status --porcelain --ignored=traditional --untracked-files=normal 2>/dev/null)" || { echo "WO-$n: worktree $rel kept: git could not read its status"; return 0; }
+  loose="$(printf '%s\n' "$st" | sed -n '/^!! /!s/^...//p' | head -5 | tr '\n' ' ' | sed 's/ $//')"
+  [ -z "$loose" ] || { echo "WO-$n: worktree $rel kept: it holds uncommitted work ($loose); commit or remove it, then:  $fin"; return 0; }
+  # git worktree remove deletes ignored files without counting them. An entry git reports (the topmost ignored
+  # folder or file, e.g. app/node_modules/) may go with the worktree only when its own name is in
+  # WORKTREE_DISPOSABLE (node_modules, a build) and it matches an ignore pattern itself; any other (app/.env)
+  # keeps it, named. git reports a folder holding only ignored files whole: a dist/ that is not ignored,
+  # holding a .env, is not disposable.
+  disp="${WORKTREE_DISPOSABLE-node_modules .venv venv __pycache__ build dist target .next .cache coverage .pytest_cache}"
+  loose=""
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    name="${e%/}"; name="${name##*/}"
+    case " $disp " in *" $name "*) git -C "$wt" check-ignore -q -- "${e%/}" 2>/dev/null && continue;; esac
+    kept=$((kept + 1)); [ "$kept" -le 5 ] && loose="$loose${loose:+ }$e"
+  done <<< "$(printf '%s\n' "$st" | sed -n 's/^!! //p')"
+  [ -z "$loose" ] || { echo "WO-$n: worktree $rel kept: it holds files git ignores ($loose); remove them if they are not needed, then:  $fin"; return 0; }
+  # Submodules may hold commits that exist nowhere else: a worktree with any (a .gitmodules file, or a gitlink in
+  # its index without one) is kept, whatever their state.
+  gl="$(git -C "$wt" ls-files -s 2>/dev/null)" || { echo "WO-$n: worktree $rel kept: git could not list its files"; return 0; }
+  sub=""; [ ! -e "$wt/.gitmodules" ] || sub=1
+  case "
+$gl" in *"
+160000 "*) sub=1;; esac
+  [ -z "$sub" ] || { echo "WO-$n: worktree $rel kept: it holds submodules; remove it by hand once their commits are pushed"; return 0; }
+  # A file git is told not to look at (skip-worktree S, assume-unchanged in lower case) can differ from its
+  # commit without status saying so.
+  lv="$(git -C "$wt" ls-files -v 2>/dev/null)" || { echo "WO-$n: worktree $rel kept: git could not list its files"; return 0; }
+  case "
+$lv" in *"
+S "*|*"
+"[abcdefghijklmnopqrstuvwxyz]" "*) echo "WO-$n: worktree $rel kept: git is told not to look at some of its files (skip-worktree or assume-unchanged); clear that and commit, then:  $fin"; return 0;; esac
+  # Never --force: git refuses a worktree it cannot remove safely (one someone locked), and that refusal is kept.
+  if ! out="$(git -C "$PROJECT_ROOT" worktree remove "$wt" 2>&1)"; then
+    echo "WO-$n: worktree $rel kept: git would not remove it ($(printf '%s\n' "$out" | head -1))"
+    return 0
+  fi
+  # -d, never -D: git deletes the branch only when it is merged, a second check on the one above.
+  if git -C "$PROJECT_ROOT" branch -d "$branch" >/dev/null 2>&1; then
+    echo "WO-$n: worktree $rel removed and branch $branch deleted (merged into $into)"
+  else
+    echo "WO-$n: worktree $rel removed; branch $branch kept (git would not delete it)"
+  fi
+}
+
 cmd_start() {
   local n="${1:-}"; [ -n "$n" ] || die "usage: wo start <number>"
   local d; d="$(wo_folder "$n")"; [ -n "$d" ] || die "no work order WO-$n"
+  [ "$(wo_state "$d" "$n")" != closed ] || die "refusing to start WO-$n: it is closed"
+  # The work happens in a worktree of its own, on its own branch, in one place inside the project and
+  # ignored by git, never in a full clone beside it. Made first, so a refusal starts nothing.
+  start_worktree "$d" "$n"
+  make_artifacts "$d" || die "wo start: could not make $d/artifacts"
   meta_set "$d" status in-progress; meta_set "$d" started "$(date +%F)"; meta_set "$d" blocked_reason ""
   echo "WO-$n: in progress (started $(date +%F))"
+  echo "$WT_LINE"
 }
 
 cmd_block() {
@@ -638,7 +997,7 @@ unfilled_placeholders() { # file -> how many template placeholders were never re
        {n=gsub(/\[[A-Za-z][^]]{2,}\]/,""); c+=n} END{print c}' "$f"
 }
 
-CHECK="$PIPELINE_ROOT/core/hooks/check.py"
+CHECK="$PIPELINE_ROOT/core/hooks/check.py"; [ -f "$CHECK" ] || [ ! -d "$PIPELINE_ROOT/hooks/scripts" ] || CHECK="$PIPELINE_ROOT/hooks/scripts/check.py"   # plugin layout
 fingerprint_excludes() { # the folders whose contents are never "the source"
   printf '%s\n' "$WORKORDERS_DIR" "${BUGS_DIR:-Workspace/Docs/Bugs}" "${SESSIONS_DIR:-Workspace/Sessions}" "${PIPELINE_ROOT#$PROJECT_ROOT/}" "${TESTING_DIR:-Workspace/Testing}/results" "${TESTING_DIR:-Workspace/Testing}/suites" "${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}"
 }
@@ -650,8 +1009,9 @@ write_manifest() { # <file> [paths csv]
 agent_file() { # name -> path of the specialist's definition, wherever this layout keeps it
   local n="$1" c
   for c in "$PROJECT_ROOT/.claude/agents/$n.md" "$PIPELINE_ROOT/core/agents/base/$n.md" "$PIPELINE_ROOT/core/agents/roles/$n.md" "$PIPELINE_ROOT/core/agents/domain/$n.md" "$PIPELINE_ROOT/agents/$n.md"; do
-    [ -f "$c" ] && { echo "$c"; return; }
+    [ -f "$c" ] && { echo "$c"; return 0; }
   done
+  return 0   # none installed: the caller says so (a failing status here stopped wo new under set -e)
 }
 write_specialists() { # dir number primary backup validator
   # The routing names the specialists; this puts them where every tool will look.
@@ -690,39 +1050,130 @@ placeholder_budget() { # [template] how many template prompts may still remain a
 latest_status() { # verification file -> PASS | FAIL | PLAN | none  (the Overall status line is authoritative; older run records are history)
   local f="$1"; [ -f "$f" ] || { echo none; return; }
   local line; line="$(grep -m1 -E '^\*\*Overall status:\*\*' "$f" || true)"
+  # The status word sits right after the marker. What follows it (the suite path, a note) is never
+  # read: a suite named "EXECUTED — PASS.sh" must not make a failing run read as passed.
+  line="${line#\*\*Overall status:\*\*}"; line="${line# }"
   case "$line" in
-    *RUNNING*) echo RUNNING;;
-    *"EXECUTED — PASS"*|*"EXECUTED - PASS"*) echo PASS;;
-    *"EXECUTED — FAIL"*|*"EXECUTED - FAIL"*) echo FAIL;;
-    *PRECONDITION*) echo PRECOND;;
-    *"NOT EXECUTED"*) echo PLAN;;
+    RUNNING*) echo RUNNING;;
+    "EXECUTED — PASS"*|"EXECUTED – PASS"*|"EXECUTED - PASS"*) echo PASS;;
+    "EXECUTED — FAIL"*|"EXECUTED – FAIL"*|"EXECUTED - FAIL"*) echo FAIL;;
+    "NOT EXECUTED — PRECONDITION"*|"NOT EXECUTED – PRECONDITION"*|"NOT EXECUTED - PRECONDITION"*) echo PRECOND;;
+    "NOT EXECUTED"*) echo PLAN;;
     *) echo none;;
   esac
 }
+fp_pathspecs() { # sets the caller's ex and scope: "the source" as git pathspecs relative to PROJECT_ROOT
+  local tdir="${TESTING_DIR:-Workspace/Testing}"
+  ex=(":!$WORKORDERS_DIR" ":!${BUGS_DIR:-Workspace/Docs/Bugs}" ":!${SESSIONS_DIR:-Workspace/Sessions}" ":!${PIPELINE_ROOT#$PROJECT_ROOT/}" ":!$tdir/results" ":!$tdir/suites" ":!${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}")
+  # The source is CODE_DIR; WO_PATHS narrows it to what the work order declared (wo new --paths)
+  scope=(.); [ "$CODE_DIR" = . ] || scope=("./$CODE_DIR")
+  [ -n "${WO_PATHS:-}" ] && IFS=, read -r -a scope <<< "$WO_PATHS"
+  return 0
+}
+fp_files() { # the files that are "the source", each path ended by a NUL, sorted by byte; run it inside PROJECT_ROOT
+  # A NUL is the one byte no file name holds: a newline, tab, quote, backslash or control character in a
+  # name would otherwise split the path, or make git quote it so it named no file, and leave it out.
+  local tdir="${TESTING_DIR:-Workspace/Testing}" ex scope; fp_pathspecs
+  if git rev-parse --show-toplevel >/dev/null 2>&1; then
+    { git ls-files -z -- "${scope[@]}" "${ex[@]}"
+      git ls-files -z -o --exclude-standard -- "${scope[@]}" "${ex[@]}"; } 2>/dev/null \
+      | LC_ALL=C sort -z -u | while IFS= read -r -d '' f; do [ -f "$f" ] && printf '%s\0' "$f"; done
+  else
+    find "${scope[@]}" -type f -not -path './.git/*' -not -path "./$WORKORDERS_DIR/*" -not -path "./${BUGS_DIR:-Workspace/Docs/Bugs}/*" -not -path "./${SESSIONS_DIR:-Workspace/Sessions}/*" \
+         -not -path "./${PIPELINE_ROOT#$PROJECT_ROOT/}/*" -not -path "./$tdir/results/*" -not -path "./$tdir/suites/*" -not -path "./${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}/*" -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path '*/dist/*' -print0 2>/dev/null \
+      | LC_ALL=C sort -z
+  fi
+}
+fp_name() { # sets FP_NAME: the path as one line, as it is, or, when it holds a newline or a backslash, a backslash
+  # then the path with each backslash doubled and each newline written \n (no plain name starts with a backslash)
+  case "$1" in *$'\n'*|*\\*) FP_NAME="${1//\\/\\\\}"; FP_NAME="\\${FP_NAME//$'\n'/\\n}";; *) FP_NAME="$1";; esac
+}
+fp_why() { # <status>: say in one line what kept the source from being fingerprinted ($t/why holds a kind and a name)
+  local n; n="$(tail -c +2 "$t/why" 2>/dev/null; printf x)"; n="${n%x}"
+  if [ "$1" -eq 3 ] && [ -s "$t/why" ]; then
+    case "$(head -c 1 "$t/why")" in
+      r) n="cannot read $(printf '%q' "$n")";;
+      g) n="$(printf '%q' "$n") is gone (it went while the source was being read)";;
+      *) n="git could not hash $(printf '%q' "$n")";;
+    esac
+  elif [ -s "$t/err" ]; then n="perl stopped: $(head -1 "$t/err")"
+  else n="git could not hash the source"; fi
+  printf '%s: %s, so the source cannot be fingerprinted\n' "${0##*/}" "$n" >&2
+}
 tree_fingerprint() { # hash of the source state the evidence was produced against; the work-order, bug, session, results, suites, and pipeline folders are excluded
-  ( set +e; cd "$PROJECT_ROOT" 2>/dev/null || { echo nofp; exit 0; }
-    local tdir="${TESTING_DIR:-Workspace/Testing}"
-    local ex=(":!$WORKORDERS_DIR" ":!${BUGS_DIR:-Workspace/Docs/Bugs}" ":!${SESSIONS_DIR:-Workspace/Sessions}" ":!${PIPELINE_ROOT#$PROJECT_ROOT/}" ":!$tdir/results" ":!$tdir/suites" ":!${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}")
-    # WO_PATHS narrows "the source" to what the work order declared (wo new --paths)
-    local scope=(.); [ -n "${WO_PATHS:-}" ] && IFS=, read -r -a scope <<< "$WO_PATHS"
+  ( set +e; set -o pipefail; cd "$PROJECT_ROOT" 2>/dev/null || { echo nofp; exit 0; }
+    # Scratch files hold names and hashes only, never the source's content, in one folder under TMPDIR that goes
+    # with this process, Ctrl-C included. Every refusal says in one line why.
+    tmpbase="${TMPDIR:-/tmp}"; t="$(mktemp -d "${tmpbase%/}/acp-fp.XXXXXX")" \
+      || { printf '%s: no scratch folder could be made under %s, so the source cannot be fingerprinted\n' "${0##*/}" "${tmpbase%/}" >&2; echo nofp; exit 0; }
+    trap 'rm -rf "$t"' EXIT; trap 'exit 1' INT TERM HUP
+    fp_files > "$t/list"
     if git rev-parse --show-toplevel >/dev/null 2>&1; then
       # Every file contributes the same way whether git tracks it yet or not: its
       # path and a hash of its content. Hashing index entries for tracked files and
       # raw bytes for untracked ones meant `git add` changed the fingerprint of a
       # file whose content had not changed, so committing the work staled the
       # evidence just produced. One hash-object process reads every path at once.
-      local list; list="$(mktemp)"
-      { git -c core.quotePath=false ls-files -- "${scope[@]}" "${ex[@]}"
-        git -c core.quotePath=false ls-files -o --exclude-standard -- "${scope[@]}" "${ex[@]}"; } 2>/dev/null \
-        | LC_ALL=C sort -u | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done > "$list"
-      paste -d' ' <(git hash-object --stdin-paths < "$list" 2>/dev/null) "$list"
-      rm -f "$list"
+      # git reads --stdin-paths from the repository's top folder, so each path is given whole ($PWD/...): from a
+      # project in a subfolder of its repository a relative path named nothing and only the names were hashed.
+      # A name hash-object cannot read from a line (a newline or carriage return in it, which it splits or strips,
+      # or a leading quote it would unquote) is hashed on its own. A file that cannot be read (by its permissions
+      # or an ACL), or that git cannot hash, makes the fingerprint nofp: never a value that hid it. Each pass over
+      # the list is one perl process, not a shell loop: on a large tree the loop cost more than the hashing.
+      local ok=1 rc
+      case "$PWD" in *$'\n'*|*$'\r'*) ok=""; printf '%s: the project'"'"'s path holds a newline or carriage return, so the source cannot be fingerprinted\n' "${0##*/}" >&2;; esac
+      if [ -n "$ok" ]; then
+        FP_WHY="$t/why" perl -C0 -0 -ne 'use filetest "access"; chomp;
+            unless (-r $_) { open(my $W, ">", $ENV{FP_WHY}); print $W ((-e $_ || -l $_) ? "r" : "g"), $_; exit 3 }
+            print "$ENV{PWD}/$_\n" unless /[\n\r]/ || /^"/' < "$t/list" > "$t/plain" 2> "$t/err"; rc=$?
+        [ "$rc" -eq 0 ] || { fp_why "$rc"; ok=""; }
+      fi
+      if [ -n "$ok" ]; then
+        { git hash-object --stdin-paths < "$t/plain" > "$t/hashes" 2>/dev/null && [ "$(wc -l < "$t/hashes")" -eq "$(wc -l < "$t/plain")" ]; } \
+          || { : > "$t/err"; fp_why 1; ok=""; }
+      fi
+      if [ -n "$ok" ]; then
+        # each record is "<blob> <name>", the name written as fp_name writes it
+        FP_WHY="$t/why" perl -C0 -0 -e 'sub no_hash { open(my $W, ">", $ENV{FP_WHY}); print $W "h", $_[0]; exit 3 }
+            open(my $H, "<", $ARGV[0]) or exit 4; while (my $f = <STDIN>) { chomp $f; my $h;
+            if ($f =~ /[\n\r]/ || $f =~ /^"/) { open(my $g, "-|", "git", "hash-object", "--", "$ENV{PWD}/$f") or no_hash($f); $h = <$g>; close $g or no_hash($f) }
+            else { local $/ = "\n"; $h = <$H> } defined $h or exit 4; $h =~ s/\n\z//;
+            my $n = $f; if ($n =~ /[\n\\]/) { $n =~ s/\\/\\\\/g; $n =~ s/\n/\\n/g; $n = "\\$n" } print "$h $n\n" }' "$t/hashes" < "$t/list" > "$t/recs" 2> "$t/err"; rc=$?
+        [ "$rc" -eq 0 ] || { fp_why "$rc"; ok=""; }
+      fi
+      if [ -n "$ok" ]; then { shasum -a 256 2>/dev/null || sha256sum; } < "$t/recs" | cut -c1-16; else echo nofp; fi
     else
-      find "${scope[@]}" -type f -not -path './.git/*' -not -path "./$WORKORDERS_DIR/*" -not -path "./${BUGS_DIR:-Workspace/Docs/Bugs}/*" -not -path "./${SESSIONS_DIR:-Workspace/Sessions}/*" \
-           -not -path "./${PIPELINE_ROOT#$PROJECT_ROOT/}/*" -not -path "./$tdir/results/*" -not -path "./$tdir/suites/*" -not -path "./${KNOWLEDGE_DIR:-Workspace/Docs/KnowledgeBase}/*" -not -path '*/node_modules/*' -not -path '*/.venv/*' -not -path '*/dist/*' 2>/dev/null \
-        | LC_ALL=C sort | while IFS= read -r f; do printf '%s\n' "$f"; cat "$f" 2>/dev/null; done
-    fi | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-16
+      # outside git: each name, then its bytes, streamed into the hash; an unreadable file refuses
+      local fp rc
+      fp="$(while IFS= read -r -d '' f; do
+          [ -r "$f" ] || { if [ -e "$f" ] || [ -L "$f" ]; then printf 'r%s' "$f"; else printf 'g%s' "$f"; fi > "$t/why"; exit 3; }
+          fp_name "$f"; printf '%s\n' "$FP_NAME"; cat "$f" 2>/dev/null || { printf 'r%s' "$f" > "$t/why"; exit 3; }
+        done < "$t/list" | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-16)"; rc=$?
+      if [ "$rc" -eq 0 ] && [ ! -s "$t/why" ]; then echo "$fp"; else fp_why 3; echo nofp; fi
+    fi
     true )
+}
+source_commit() { # the commit the source was at, with a note when the source differs from it
+  ( set +e; cd "$PROJECT_ROOT" 2>/dev/null && git rev-parse --show-toplevel >/dev/null 2>&1 || { echo "none (not a git repository)"; exit 0; }
+    local c ex scope; c="$(git rev-parse --verify -q HEAD 2>/dev/null)" || { echo "none (no commit yet)"; exit 0; }
+    fp_pathspecs
+    if [ -n "$(git status --porcelain --untracked-files=normal -- "${scope[@]}" "${ex[@]}" 2>/dev/null | head -1)" ]; then
+      echo "$c (with uncommitted changes in the source)"
+    else echo "$c"; fi
+    true )
+}
+code_dir_check() { # refuse a CODE_DIR whose fingerprint would cover no code: it would never change, so a change to the code would never stale the evidence
+  [ "$CODE_DIR" = . ] && return 0
+  local p="$PROJECT_ROOT/$CODE_DIR" e
+  [ -d "$p" ] || die "CODE_DIR $CODE_DIR is not a folder in the project"
+  [ "$(cd "$p" 2>/dev/null && pwd -P)" = "$p" ] || die "CODE_DIR $CODE_DIR is or passes through a symbolic link"
+  case "/$CODE_DIR/" in */.git/*) die "CODE_DIR $CODE_DIR is inside .git";; esac
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    case "$CODE_DIR/" in "$e"/*) die "CODE_DIR $CODE_DIR is inside $e, which is pipeline work, not code";; esac
+  done < <(fingerprint_excludes; printf '%s\n' "${WORKSPACE_DIR:-Workspace}")
+  [ "$(cd "$PROJECT_ROOT" && fp_files | head -c 1 | wc -c | tr -d ' ')" -gt 0 ] || die "CODE_DIR $CODE_DIR holds no file the fingerprint reads (empty, ignored by git, or excluded)"
+  return 0
 }
 suite_fingerprint() { # suite file -> hash of the suite that produced the evidence
   [ -f "$1" ] && { shasum -a 256 2>/dev/null || sha256sum; } < "$1" | cut -c1-16 || echo none
@@ -773,18 +1224,37 @@ cmd_integrate() { # open the integration work order for a batch of parallel work
     local cd_; cd_="$(wo_folder "$c")"; [ -n "$cd_" ] || die "no work order WO-$c to cover"
     local f; f="$(ls "$PROJECT_ROOT/${TESTING_DIR:-Workspace/Testing}/suites/" 2>/dev/null | grep -i "^wo-$c-" | head -1)"
     [ -n "$f" ] || die "WO-$c has no suite in ${TESTING_DIR:-Workspace/Testing}/suites/ — every covered work order must be verified on its own first"
+    # the name lands inside double quotes in the generated suite, and is split on spaces there
+    case "$f" in *[!A-Za-z0-9._-]*) die "WO-$c's suite '$f' is not a plain file name (letters, digits, . _ -); rename it";; esac
     suites="$suites $f"
   done
   suites="${suites# }"
-  cmd_new "$title" --size standard --area integration
-  local num; num="$(ls -d "$WO_DIR"/WO-* 2>/dev/null | sed 's|.*/WO-||; s|-.*||' | sort -n | tail -1)"
+  # the two paths land inside double quotes in the generated suite; refused before the work order is made
+  local v; for v in "${PIPELINE_ROOT#$PROJECT_ROOT/}" "${TESTING_DIR:-Workspace/Testing}"; do
+    case "$v" in *[\"\$\`\\]*|*$'\n'*) die "the path '$v' holds a quote, \$, backtick, backslash or newline, which the generated suite would run; move or rename it";; esac
+  done
+  # the suite's template is checked before the work order is made, as render checks its own
+  local tpl="$TESTING_TEMPLATES/INTEGRATION-SUITE-TEMPLATE.sh"
+  [ -f "$tpl" ] && [ -r "$tpl" ] || die "template missing or unreadable: $tpl"
+  # The number is the one cmd_new reserved, read from its own report, not the highest WO-* name on disk:
+  # a folder numbering skips (WO-0099x-...), or an order opened meanwhile, was taken instead.
+  # set -e inside, as wo import does: a command substitution drops errexit, so a failure part-way through
+  # cmd_new went on, printed "created" and kept the half-made folder.
+  local made num="" line; made="$(set -e; cmd_new "$title" --size standard --area integration)"
+  printf '%s\n' "$made"
+  while IFS= read -r line; do
+    case "$line" in WO-[0-9]*" created ("*) num="${line#WO-}"; num="${num%% *}"; break;; esac
+  done <<< "$made"
+  case "$num" in ""|*[!0-9]*) die "wo integrate: could not read the number wo new reserved";; esac
   local d; d="$(wo_folder "$num")"
   meta_set "$d" covers "$(printf '%s' "$list" | tr ' ' ',')"
   local slug; slug="$(basename "$d")"; slug="${slug#WO-$num-}"
   local out="$PROJECT_ROOT/${TESTING_DIR:-Workspace/Testing}/suites/wo-$num-$slug.sh"
-  sed -e "s/WO-XXXX/WO-$num/g" -e "s/\[Title\]/$slug/g" -e "s|{{PIPELINE_ROOT}}|${PIPELINE_ROOT#$PROJECT_ROOT/}|g" \
-      -e "s|{{TESTING_DIR}}|${TESTING_DIR:-Workspace/Testing}|g" -e "s|{{COVERED_SUITES}}|$suites|g" \
-      "$TESTING_TEMPLATES/INTEGRATION-SUITE-TEMPLATE.sh" > "$out"
+  # The values go in as data, in one pass, as render does.
+  ACP_T_NUM="$num" ACP_T_SLUG="$slug" ACP_T_PR="${PIPELINE_ROOT#$PROJECT_ROOT/}" ACP_T_TD="${TESTING_DIR:-Workspace/Testing}" ACP_T_SU="$suites" perl -C0 -pe '
+    BEGIN { %v = ("WO-XXXX" => "WO-$ENV{ACP_T_NUM}", "[Title]" => $ENV{ACP_T_SLUG}, "{{PIPELINE_ROOT}}" => $ENV{ACP_T_PR}, "{{TESTING_DIR}}" => $ENV{ACP_T_TD}, "{{COVERED_SUITES}}" => $ENV{ACP_T_SU}) }
+    s/(WO-XXXX|\[Title\]|\{\{PIPELINE_ROOT\}\}|\{\{TESTING_DIR\}\}|\{\{COVERED_SUITES\}\})/$v{$1}/g;
+  ' "$TESTING_TEMPLATES/INTEGRATION-SUITE-TEMPLATE.sh" > "$out"
   chmod +x "$out"
   echo
   echo "Integration work order WO-$num covers: $(printf '%s' "$list" | tr ' ' ',')"
@@ -801,6 +1271,10 @@ cmd_suite() { # scaffold a behavioural suite: from the shipped template, or wrap
   [ -n "$n" ] || die "usage: wo suite <number> [--wrap '<command that runs the project's own tests>']"
   local d; d="$(wo_folder "$n")"; [ -n "$d" ] || die "no work order WO-$n under $WO_DIR"
   local slug; slug="$(basename "$d")"; slug="${slug#WO-$n-}"
+  # the two paths land inside double quotes in the generated suite
+  local v; for v in "${PIPELINE_ROOT#$PROJECT_ROOT/}" "${TESTING_DIR:-Workspace/Testing}"; do
+    case "$v" in *[\"\$\`\\]*|*$'\n'*) die "the path '$v' holds a quote, \$, backtick, backslash or newline, which the generated suite would run; move or rename it";; esac
+  done
   local dir="$PROJECT_ROOT/${TESTING_DIR:-Workspace/Testing}/suites" out
   mkdir -p "$dir"; out="$dir/wo-$n-$slug.sh"
   [ -e "$out" ] && die "$out already exists"
@@ -826,7 +1300,12 @@ cmd_suite() { # scaffold a behavioural suite: from the shipped template, or wrap
       printf '%s\n' "$wrap"
     } > "$out"
   else
-    sed -e "s/WO-XXXX/WO-$n/g" -e "s/\[Title\]/$slug/g" -e "s|{{PIPELINE_ROOT}}|${PIPELINE_ROOT#$PROJECT_ROOT/}|g" "$TESTING_TEMPLATES/SUITE-TEMPLATE.sh" > "$out"
+    # the values go in as data, in one pass, as render does; a missing template refused first
+    [ -f "$TESTING_TEMPLATES/SUITE-TEMPLATE.sh" ] && [ -r "$TESTING_TEMPLATES/SUITE-TEMPLATE.sh" ] || die "template missing or unreadable: $TESTING_TEMPLATES/SUITE-TEMPLATE.sh"
+    ACP_T_NUM="$n" ACP_T_SLUG="$slug" ACP_T_PR="${PIPELINE_ROOT#$PROJECT_ROOT/}" perl -C0 -pe '
+      BEGIN { %v = ("WO-XXXX" => "WO-$ENV{ACP_T_NUM}", "[Title]" => $ENV{ACP_T_SLUG}, "{{PIPELINE_ROOT}}" => $ENV{ACP_T_PR}) }
+      s/(WO-XXXX|\[Title\]|\{\{PIPELINE_ROOT\}\})/$v{$1}/g;
+    ' "$TESTING_TEMPLATES/SUITE-TEMPLATE.sh" > "$out"
   fi
   chmod +x "$out"
   echo "Suite scaffolded: ${out#$PROJECT_ROOT/}"
@@ -841,6 +1320,7 @@ cmd_verify() {
     case "$1" in --run) suite="$2"; shift 2;; --force) force=1; shift;; -*) die "unknown flag $1";; *) n="$1"; shift;; esac
   done
   [ -n "$n" ] || die "usage: wo verify <number> [--run <suite.sh>] [--force]"
+  not_in_worktree verify "$n"
   local d; d="$(wo_folder "$n")"; [ -n "$d" ] || die "no work order WO-$n"
   export WO_PATHS; WO_PATHS="$(meta_get "$d" paths)"
   local out="$d/WO-$n-VERIFICATION.md" title; title="$(meta_get "$d" title)"; title="${title:-$(basename "$d")}"
@@ -850,19 +1330,28 @@ cmd_verify() {
     echo "WO-$n verification document created: $out"
   fi
   [ -z "$suite" ] && { echo "Status is NOT EXECUTED — PLAN ONLY until you run something:  wo verify $n --run <suite.sh>"; return 0; }
+  # A newline or carriage return in the path would split the status line and could forge a second one.
+  case "$suite" in *$'\n'*|*$'\r'*) die "suite path holds a newline or carriage return; rename the suite";; esac
   [ -f "$suite" ] || die "suite not found: $suite"
-  local stamp log rc status fp_before fp_after
+  code_dir_check
+  local stamp log rc status fp_before fp_after commit
   stamp="$(date +%Y%m%d-%H%M%S)-$$"; log="$d/WO-$n-VERIFICATION-$stamp.log"
-  echo "Running: $suite"
   # Mark the run before it starts. A verification that is interrupted — a killed
   # process group, a closed laptop — must not leave an older PASS standing as the
   # authoritative answer, and nothing that runs at exit can be relied on to say so.
-  fp_before="$(tree_fingerprint)"
-  perl -pi -e "s|^\*\*Overall status:\*\* .*|**Overall status:** RUNNING (run $stamp started, tree $fp_before)|" "$out"
+  fp_before="$(tree_fingerprint)"; commit="$(source_commit)"
+  [ "$fp_before" != nofp ] || die "cannot fingerprint the source (the line above says why); nothing was run or recorded"
+  echo "Running: $suite"
+  ACP_V_LINE="**Overall status:** RUNNING (run $stamp started, tree $fp_before)" perl -C0 -pi -e 's/^\*\*Overall status:\*\* .*/$ENV{ACP_V_LINE}/' "$out"
   set +e; bash "$suite" >"$log" 2>&1; rc=$?; set -e
   fp_after="$(tree_fingerprint)"
-  # Keep evidence portable and shareable: no host paths in the record.
-  perl -pi -e "s|\Q$PROJECT_ROOT/\E||g" "$log" 2>/dev/null || true
+  # Keep evidence portable and shareable: no host paths in the log, the record or the issue comment.
+  # The project's path goes first (a path under it becomes relative, the project itself "."), then the
+  # home folder becomes "~"; wherever it starts (a file:// URL, a -I flag, colour codes) but only where it
+  # ends, so <root>x is kept; a home that is empty or "/" is left alone.
+  ACP_V_ROOT="$PROJECT_ROOT" ACP_V_HOME="${HOME:-}" perl -C0 -pi -e 'BEGIN { $r=$ENV{ACP_V_ROOT}; $h=$ENV{ACP_V_HOME}; $h=~s#/+\z##; $p=q#[^\s"\x27`=:;,|()<>\[\]{}]# } if (length $r) { s#\Q$r\E/##g; s#\Q$r\E(?!$p)#.#g } s#\Q$h\E(?=/|(?!$p))#~#g if length $h' "$log" 2>/dev/null || true
+  local shown="${suite#"$PROJECT_ROOT"/}" hm="${HOME:-}"; hm="${hm%/}"   # the prefix quoted: a literal, not a pattern
+  case "$hm" in "") ;; *) case "$shown" in "$hm"/*) shown="~/${shown#"$hm"/}";; esac;; esac
   # Exit 77 is reserved: "I could not run". A suite whose environment never came up
   # has asserted nothing, and recording that as a failure would put the tool's
   # authority behind a claim about the code that no check ever made.
@@ -888,20 +1377,22 @@ cmd_verify() {
   fi
   {
     printf '\n### Run %s\n\n' "$stamp"
-    printf -- '- **Status:** %s\n- **Command:** `bash %s`\n- **Exit code:** %s\n- **Log:** `%s`\n' "$status" "$suite" "$rc" "$(basename "$log")"
+    printf -- '- **Status:** %s\n- **Command:** `bash %s`\n- **Exit code:** %s\n- **Log:** `%s`\n' "$status" "$shown" "$rc" "$(basename "$log")"
+    printf -- '- **Commit:** %s\n' "$commit"
     [ -n "$checks" ] && printf -- '- **Checks:** %s\n' "$checks"
-    printf -- '- **Suite:** `%s` (%s)\n' "${suite#$PROJECT_ROOT/}" "$shash"
+    printf -- '- **Suite:** `%s` (%s)\n' "$shown" "$shash"
     [ -n "$drift" ] && printf -- '- **Source state:** %s\n' "$drift"
     printf '\n' 
     printf '```\n'; tail -60 "$log"; printf '```\n'
   } >> "$out"
-  local ratio=""; [ -n "$counts" ] && ratio=", checks ${counts% *}/$(( ${counts% *} + ${counts#* } ))"
-  perl -pi -e "s|^\*\*Overall status:\*\* .*|**Overall status:** $status (last run $stamp, tree $fp_after, suite ${suite#$PROJECT_ROOT/}\@$shash$ratio)|" "$out"
+  local ratio=""; [ -n "$counts" ] && ratio=", checks ${counts% *}/$(( 10#${counts% *} + 10#${counts#* } ))"   # decimal: a suite may print 08
+  # The suite path and the other values go in as data (register D-2): a path holding | $ @ or perl code is written as typed.
+  ACP_V_LINE="**Overall status:** $status (last run $stamp, tree $fp_after, suite $shown@$shash$ratio)" perl -C0 -pi -e 's/^\*\*Overall status:\*\* .*/$ENV{ACP_V_LINE}/' "$out"
   echo "$status (exit $rc${checks:+; $checks}) — recorded in $(basename "$out"), full log in $(basename "$log")"
   [ "$rc" -eq 77 ] && echo "The suite could not establish its preconditions, so nothing was asserted. Fix the environment and run it again."
   local inum; inum="$(meta_get "$d" issue_number)"
   if [ -n "$inum" ] && command -v gh >/dev/null 2>&1; then
-    REPO="$(gh_repo)"; [ -n "$REPO" ] && gh issue comment "$inum" --repo "$REPO" --body "$(printf '**Verification %s** — `bash %s` exit %s\n\n```\n%s\n```' "$status" "$suite" "$rc" "$(tail -20 "$log")")" >/dev/null 2>&1 && echo "Result posted to issue #$inum"
+    REPO="$(gh_repo)"; [ -n "$REPO" ] && gh issue comment "$inum" --repo "$REPO" --body "$(printf '**Verification %s** — `bash %s` exit %s\n\n```\n%s\n```' "$status" "$shown" "$rc" "$(tail -20 "$log")")" >/dev/null 2>&1 && echo "Result posted to issue #$inum"
   fi
   [ "$rc" -eq 0 ] || return 1
 }
@@ -979,27 +1470,61 @@ cmd_promote() {
     The pitfalls are the part the next project needs. Fill them in, or pass --allow-placeholders."
   fi
   playbook="${playbook:-$PROJECT_SLUG}"
-  local pdir="$PLAYBOOKS_DIR/$playbook" tree="workorders"
+  # A playbook is one folder directly in the playbooks folder: a name such as ../x would make the
+  # rm -rf and the copy below act outside it. The same rule as new-project's --playbook.
+  case "$playbook" in ''|.*|-*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*)
+    die "refusing to promote WO-$n: '$playbook' is not a playbook name (letters, digits, '.', '_' and '-'; not starting with '.' or '-')";;
+  esac
+  local pbase; pbase="$("$PIPELINE_ROOT/bin/playbook" where)" || exit 1   # the playbooks folder; playbook says why it refuses one
+  local pdir="$pbase/$playbook" tree="workorders"
   [ -x "$PIPELINE_ROOT/bin/sanitize" ] || die "bin/sanitize is missing from $PIPELINE_ROOT/bin — refusing to promote unscanned work. Re-run install.sh."
-  if true; then
-    rc=0; "$PIPELINE_ROOT/bin/sanitize" "$d" --quiet >/dev/null 2>&1 || rc=$?
-    if [ "$rc" -eq 2 ]; then
-      if [ "$allow" -eq 0 ]; then
-        die "refusing to promote WO-$n: it fails sanitization (secrets, PII, or host paths).
-    $PIPELINE_ROOT/bin/sanitize \"$d\"   shows what. Fix, or pass --allow-unsanitized for a private playbook."
-      fi
-    fi
+  # The order's artifacts/ holds its working files (logs, scratch, review copies): they stay with the
+  # order, and a playbook carries the record only. The copy is made aside without them, and what is
+  # sanitized is exactly what is copied.
+  if [ -e "$d/artifacts" ] || [ -L "$d/artifacts" ]; then
+    { [ -d "$d/artifacts" ] && [ ! -L "$d/artifacts" ]; } || die "refusing to promote WO-$n: $d/artifacts is not a plain folder"
+  fi
+  local b stage left=0 san; b="$(basename "$d")"
+  local tmpbase="${TMPDIR:-/tmp}"
+  stage="$(mktemp -d "${tmpbase%/}/acp-promote.XXXXXX")" || die "refusing to promote WO-$n: no room to stage the copy"
+  # the stage goes however this ends, an interrupt included
+  _acp_stage="$stage"; trap 'rm -rf "$_acp_stage"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+  cp -R "$d" "$stage/$b" || die "refusing to promote WO-$n: the copy could not be made"
+  if [ -d "$stage/$b/artifacts" ]; then
+    left="$(find "$stage/$b/artifacts" -type f | wc -l | tr -d ' ')"; rm -rf "$stage/$b/artifacts"
+  fi
+  rc=0; san="$("$PIPELINE_ROOT/bin/sanitize" "$stage/$b" 2>&1)" || rc=$?
+  if [ "$rc" -eq 2 ] && [ "$allow" -eq 0 ]; then
+    die "refusing to promote WO-$n: what would be copied (the order without artifacts/) fails sanitization (secrets, PII,
+    or host paths). The findings, relative to $d:
+$(printf '%s\n' "$san" | { grep -E '^- \*\*\[' || true; } | sed 's/^/    /')
+    Fix them, or pass --allow-unsanitized for a private playbook."
   fi
   mkdir -p "$pdir/$tree"
-  local b; b="$(basename "$d")"
-  rm -rf "$pdir/$tree/$b"; cp -R "$d" "$pdir/$tree/$b"
+  rm -rf "$pdir/$tree/$b"; cp -R "$stage/$b" "$pdir/$tree/$b"
+  rm -rf "$stage"; trap - EXIT INT TERM
+  case "$left" in 0) ;; 1) echo "promote: left out artifacts/ (1 file): working files stay with the order, never in a playbook";;
+    *) echo "promote: left out artifacts/ ($left files): working files stay with the order, never in a playbook";; esac
   # The tests are what make precedent reusable; a description of a test is not.
-  # Every suite the verification record names travels with the work order.
-  local carried=() sp
-  for sp in $(grep -oE '\*\*Command:\*\* `bash [^`]+`' "$d/WO-$n-VERIFICATION.md" 2>/dev/null | sed -E 's/.*`bash ([^`]+)`.*/\1/' | sort -u); do
-    if [ -f "$PROJECT_ROOT/$sp" ]; then mkdir -p "$pdir/$tree/$b/suite"; cp "$PROJECT_ROOT/$sp" "$pdir/$tree/$b/suite/"; carried+=("$sp")
-    elif [ -f "$sp" ]; then mkdir -p "$pdir/$tree/$b/suite"; cp "$sp" "$pdir/$tree/$b/suite/"; carried+=("$sp"); fi
-  done
+  # Every suite a **Suite:** line of the verification record names travels with the work order, but only
+  # a regular file directly in the project's own suites folder, compared by physical path, so a path
+  # written into a record cannot copy any other file on the machine into a playbook.
+  local carried=() sp sd sp_dir name pr c dup tdir="${TESTING_DIR:-Workspace/Testing}"
+  pr="$(cd -P "$PROJECT_ROOT" 2>/dev/null && pwd -P)" || pr=""
+  sd="$(cd -P "$PROJECT_ROOT/$tdir/suites" 2>/dev/null && pwd -P)" || sd=""
+  case "$sd/" in "$pr"/?*) ;; *) sd="";; esac   # the suites folder itself lies inside the project
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    name="${sp##*/}"
+    sp_dir="$(cd -P "$(dirname "$PROJECT_ROOT/$sp")" 2>/dev/null && pwd -P)" || sp_dir=""
+    if [ -n "$sd" ] && [ -n "$name" ] && [ "$sp_dir" = "$sd" ] && [ -f "$sd/$name" ] && [ ! -L "$sd/$name" ]; then
+      dup=0; for c in ${carried[@]+"${carried[@]}"}; do if [ "$c" = "$tdir/suites/$name" ]; then dup=1; fi; done
+      [ "$dup" -eq 1 ] && continue   # one suite named two ways travels once
+      mkdir -p "$pdir/$tree/$b/suite"; cp "$sd/$name" "$pdir/$tree/$b/suite/"; carried+=("$tdir/suites/$name")
+    else
+      echo "promote: not carried: $sp (not a regular file in $tdir/suites)"
+    fi
+  done < <(awk '/^### Run / { fenced = 0 } /^```/ { fenced = !fenced; next } !fenced' "$d/WO-$n-VERIFICATION.md" 2>/dev/null | sed -n 's/^- \*\*Suite:\*\* `\([^`]*\)` (.*$/\1/p' | LC_ALL=C sort -u)
   # --- catalog entry: deterministic extraction from the documents ---
   local entry_dir="$pdir/catalog" entry="$pdir/catalog/WO-$n.md" spec close title problem solution pitfalls files
   mkdir -p "$entry_dir"
@@ -1039,7 +1564,7 @@ cmd_promote() {
     if [ -n "$pitfalls" ]; then printf '%s\n' "$pitfalls" | sed 's/^/    /'; else printf '    _(none recorded — add what would have saved you time)_\n'; fi
     printf '\n'
   } > "$entry"
-  PLAYBOOKS_DIR="$PLAYBOOKS_DIR" "$PIPELINE_ROOT/bin/playbook" catalog "$playbook" >/dev/null 2>&1 || true
+  "$PIPELINE_ROOT/bin/playbook" catalog "$playbook" >/dev/null || die "WO-$n was copied to $pdir, but its catalog could not be rebuilt (above)"
   echo "WO-$n promoted to playbook '$playbook': $pdir/$tree/$b"
   echo "Catalog entry written: $entry (CATALOG.md regenerated from catalog/)"
   echo "Edit the Pitfalls lines now, while you still remember."
@@ -1056,7 +1581,7 @@ case "${1:-}" in
   verify)  shift; cmd_verify "$@";;
   suite)   shift; cmd_suite "$@";;
   adopt)   shift; cmd_adopt "$@";;
-  fingerprint) shift; export WO_PATHS="${1:-}"; tree_fingerprint;;
+  fingerprint) shift; export WO_PATHS="${1:-}"; code_dir_check; fp="$(tree_fingerprint)"; [ "$fp" != nofp ] || die "cannot fingerprint the source (the line above says why)"; echo "$fp";;
   counts) shift; check_counts "${1:?usage: wo counts <log>}";;
   integrate) shift; cmd_integrate "$@";;
   stats)   shift; cmd_stats;;

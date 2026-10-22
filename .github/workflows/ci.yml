@@ -113,8 +113,16 @@ jobs:
       - name: node --check every javascript file
         run: |
           rc=0
+          # A workflow script runs wrapped in an async function (its top-level await and return are legal there), with
+          # its meta exported: it is checked the way it runs. Every other file is checked as it is.
           while IFS= read -r f; do
-            node --check "$f" || { echo "  PARSE ERROR: $f"; rc=1; }
+            case "$f" in
+              *.workflow.js)
+                w="$RUNNER_TEMP/workflow-check.js"
+                { printf '(async () => {\n'; sed 's/^export const meta/const meta/' "$f"; printf '\n})();\n'; } > "$w"
+                node --check "$w" || { echo "  PARSE ERROR: $f (checked wrapped, as workflows run)"; rc=1; };;
+              *) node --check "$f" || { echo "  PARSE ERROR: $f"; rc=1; };;
+            esac
           done < "$RUNNER_TEMP/js.txt"
           [ "$rc" -eq 0 ] && echo "  all javascript files parse"
           exit "$rc"

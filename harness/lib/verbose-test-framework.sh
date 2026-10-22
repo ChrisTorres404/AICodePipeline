@@ -62,7 +62,7 @@ export AUTH_EXTRA_LOGIN_FIELDS="${AUTH_EXTRA_LOGIN_FIELDS:-$_default_extra_field
 # Database Configuration (optional — SQL helpers are inert without DB_NAME)
 export DB_HOST="${DB_HOST:-localhost}"
 export DB_PORT="${DB_PORT:-5432}"
-export DB_USER="${DB_USER:-$USER}"
+export DB_USER="${DB_USER:-${USER:-$(id -un 2>/dev/null || true)}}"
 export DB_NAME="${DB_NAME:-}"
 export PGPASSWORD="${PGPASSWORD:-${DB_PASS:-}}"
 

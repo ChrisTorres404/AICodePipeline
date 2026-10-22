@@ -11,7 +11,10 @@ Internal host names are reported at WARNING: a name is a judgement call that no
 regex settles on its own, so the rule is tuned to put a human in front of the
 finding rather than to fail a release.
 
-    bin/sanitize <dir> [--report <file.md>] [--allow <regex>]... [--quiet]
+    bin/sanitize <dir> [--report <file.md>] [--allow <regex>]... [--include-logs] [--quiet]
+
+.log files are not read unless --include-logs is given: a default scan is unchanged, so a
+playbook that already holds run logs does not start failing; promote will ask for them.
 
 A file named .sanitize-ignore in <dir> lists relative paths to skip, one per
 line, for files that legitimately contain patterns (a substitution table, a
@@ -141,33 +144,95 @@ def hostname_is_internal(m, line):
         return False
     return _looks_like_host(labels, line, start, end)
 
+# --- email addresses ---------------------------------------------------------
+# An address at a personal mail provider is a CRITICAL `pii.email` finding, in every
+# mode. Any other address is an `email.address` WARNING: a work or project address may
+# be a public contact a reviewer keeps, but a person has to look at it. Not reported:
+# the reserved documentation names (RFC 2606, RFC 6761), noreply senders, and the
+# shapes that only look like an address: a URL's user part (scheme://user:pass@host),
+# git@host: remotes, package pins (name@1.2.3: no alphabetic top-level domain, so the
+# regex never matches) and image density names (icon@2x.png).
+PERSONAL_DOMAIN_RE = re.compile(r"(?i:(gmail|yahoo|hotmail|outlook|protonmail|icloud|me|aol)\.(com|net|org))(?![A-Za-z0-9])")
+# Both ends are bounded like EMAIL_RE's (look-arounds, not \b), so pii.email reports an address
+# exactly when email_is_reportable's domain test skips it, and neither regex retries inside a
+# long run of user-part characters.
+PERSONAL_EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@" + PERSONAL_DOMAIN_RE.pattern)
+EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])([A-Za-z0-9._%+-]+)@((?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+([A-Za-z]{2,63}))(?![A-Za-z0-9-])")
+RESERVED_EMAIL_DOMAINS = {"example.com", "example.net", "example.org"}
+RESERVED_EMAIL_TLDS = {"test", "example", "invalid", "localhost"}
+NOREPLY_EMAIL_USERS = {"noreply", "no-reply"}
+NOREPLY_EMAIL_DOMAINS = {"users.noreply.github.com"}
+
+def _is_or_under(domain, names):
+    return any(domain == d or domain.endswith("." + d) for d in names)
+
+# Look back this far at most: a URL's scheme://user:pass@ is never longer, and the bound
+# keeps the work per match constant on a minified line holding thousands of matches.
+URL_LOOKBACK = 512
+# Characters that end a URL before a user part could start, as in minified JSON:
+# {"homepage":"https://host","author":"name@host"}.
+URL_USER_PART_STOPS = "\"'<>()[]{},;`|\\"
+
+def _in_url_user_part(line, start):
+    """True when the text before `start` is scheme://user[:pass]@, even with an @ in the password."""
+    window = line[max(0, start - URL_LOOKBACK):start]
+    tok = "" if not window or window[-1].isspace() else window.split()[-1]   # any Unicode whitespace
+    tok = tok[max(tok.rfind(c) for c in URL_USER_PART_STOPS) + 1:]
+    i = tok.rfind("://")
+    return i > 0 and (tok[i - 1].isalnum() or tok[i - 1] in "+.-") and "/" not in tok[i + 3:]
+
+def email_is_reportable(m, line):
+    """True for an address that is not personal (pii.email reports those), reserved, noreply, or not an address."""
+    user, domain, tld = m.group(1).lower(), m.group(2).lower(), m.group(3).lower()
+    if PERSONAL_DOMAIN_RE.match(domain):                                 # pii.email reports it
+        return False
+    if _is_or_under(domain, RESERVED_EMAIL_DOMAINS) or tld in RESERVED_EMAIL_TLDS:
+        return False
+    if user in NOREPLY_EMAIL_USERS or _is_or_under(domain, NOREPLY_EMAIL_DOMAINS):
+        return False
+    if user == "git":                                                    # git@host:org/repo.git
+        return False
+    if _in_url_user_part(line, m.start()):                              # scheme://user:pass@host
+        return False
+    return re.match(r"\d+(?:\.\d+)?x\.", domain) is None                  # icon@2x.png
+
 # A pattern may name a predicate here; a match it rejects is not a finding, and
 # the scan carries on to the remaining patterns for that line.
-VALIDATORS = {"infra.hostname": hostname_is_internal}
+VALIDATORS = {"infra.hostname": hostname_is_internal, "email.address": email_is_reportable}
 
 # (id, severity, regex, label)  — severity: CRITICAL | WARNING
 PATTERNS = [
     ("secret.apikey",  "CRITICAL", re.compile(r"(?i)\b(api[_-]?key|apikey|api[_-]?secret|client[_-]?secret)\b\s*[:=]\s*['\"]?[A-Za-z0-9+/=_\-]{16,}"), "API key or client secret"),
     ("secret.pk",      "CRITICAL", re.compile(r"\bpk_(test|live)_[A-Za-z0-9]{16,}"), "publishable/test key"),
-    ("secret.sk",      "CRITICAL", re.compile(r"\bsk_(test|live)_[A-Za-z0-9]{16,}"), "secret key"),
+    ("secret.sk",      "CRITICAL", re.compile(r"\b[sr]k_(test|live)_[A-Za-z0-9]{16,}"), "secret or restricted key"),
+    ("secret.stripewh","CRITICAL", re.compile(r"\bwhsec_[A-Za-z0-9]{32,}"), "Stripe webhook secret"),
     ("secret.aws",     "CRITICAL", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key id"),
+    ("secret.awstemp", "CRITICAL", re.compile(r"\bASIA[0-9A-Z]{16}\b"), "AWS temporary access key id"),
     ("secret.awssec",  "CRITICAL", re.compile(r"(?i)aws_secret(_access)?_key\s*[:=]\s*['\"]?[A-Za-z0-9+/=]{20,}"), "AWS secret key"),
     # What makes a connection URL dangerous is the password, not the username: key
     # the exemption off the secret itself, so a rendered project slug does not
     # turn an obvious placeholder into a critical finding.
     ("secret.dburl",   "CRITICAL", re.compile(r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql)://(?P<dbuser>[^:/\s@'\"]+):(?!\$\{|\{\{|<|(?P=dbuser)@|\w*(?:pass|secret|token)\w*@|%s)[^@\s'\"]{3,}@" % "|".join(("pass","password","passwd","secret","changeme","example","placeholder","your","xxx","redacted","dbpass","pwd"))), "database URL with credentials"),
     ("secret.jwt",     "CRITICAL", re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}"), "JWT"),
-    ("secret.privkey", "CRITICAL", re.compile(r"-----BEGIN\s+(RSA\s+|EC\s+|DSA\s+|OPENSSH\s+)?PRIVATE KEY-----"), "private key"),
+    ("secret.privkey", "CRITICAL", re.compile(r"-----BEGIN\s+(?:[A-Z0-9]+\s+)*PRIVATE KEY-----"), "private key"),
+    ("secret.pgp",     "CRITICAL", re.compile(r"-{5}BEGIN PGP PRIVATE KEY BLOCK-{5}"), "PGP private key"),
     ("secret.github",  "CRITICAL", re.compile(r"\b(gh[pousr]_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{22,})"), "GitHub token"),
     ("secret.google",  "CRITICAL", re.compile(r"\bGOCSPX-[A-Za-z0-9_-]+"), "Google OAuth secret"),
+    ("secret.googlekey","CRITICAL", re.compile(r"\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"), "Google API key"),
+    ("secret.openai",  "CRITICAL", re.compile(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|\bsk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}\b"), "OpenAI key"),
+    ("secret.anthropic","CRITICAL", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"), "Anthropic API key"),
+    ("secret.gitlab",  "CRITICAL", re.compile(r"\bgl(?:pat|dt|rt|ptt|cbt|soat|ft|imt|oas)-[A-Za-z0-9_-]{20,}"), "GitLab token"),
+    ("secret.slacktok","CRITICAL", re.compile(r"\bxox[abeposr]-[0-9]+-[0-9A-Za-z-]{10,}|\bxapp-[0-9]+-[A-Za-z0-9]+-[0-9]+-[A-Za-z0-9]{20,}"), "Slack token"),
     ("secret.slack",   "CRITICAL", re.compile(r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"), "Slack webhook"),
     ("secret.sendgrid","CRITICAL", re.compile(r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}"), "SendGrid key"),
-    ("secret.password","CRITICAL", re.compile(r"(?i)\b(password|passwd|pwd|pgpassword|db_pass(word)?|mysql_pwd)\b\s*[:=]\s*['\"](?!\$\{|\{\{|<|test|example|changeme|placeholder|mysecret|secret|hunter2|s3cr3t|your[_-]?)[^'\"\s]{6,}['\"]"), "password literal"),
-    ("pii.email",      "CRITICAL", re.compile(r"\b[A-Za-z0-9._%+-]+@(gmail|yahoo|hotmail|outlook|protonmail|icloud|me|aol)\.(com|net|org)\b"), "personal email address"),
+    ("secret.password","CRITICAL", re.compile(r"(?i:\b(password|passwd|pwd|pgpassword|db_pass(word)?|mysql_pwd)\b\s*[:=]\s*['\"](?!\$\{|\{\{|<|test|example|changeme|placeholder|mysecret|secret|hunter2|s3cr3t|your[_-]?)[^'\"\s]{6,}['\"])"
+                                             r"|^[ \t]*(?:-[ \t]+)?(?:export[ \t]+)?(?:[A-Z0-9_]*(?:PASSWORD|PASSWD)|(?:[A-Z0-9_]*_)?PASS)=(['\"]?)(?!\$|\\|\{\{|<|`|%|\*{3,}|(?i:test|example|changeme|change_?me|placeholder|mysecret|secret|hunter2|s3cr3t|your[_-]?|x{3,}|\[?redacted|\w*(?:pass|secret|token)))[^'\"\s]{6,}\3(?:\s|$)"), "password literal"),
+    ("pii.email",      "CRITICAL", PERSONAL_EMAIL_RE, "personal email address"),
+    ("email.address",  "WARNING",  EMAIL_RE, "email address"),
     ("infra.privip",   "WARNING",  re.compile(r"\b(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b"), "private IP"),
     ("infra.pubip",    "CRITICAL", re.compile(r"(?<![/v\w.-])(?!(?:10|127|0)\.)(?!192\.0\.2\.)(?!198\.51\.100\.)(?!203\.0\.113\.)(?!93\.184\.216\.34)(?!255\.)(?!1\.1\.1\.1\b)(?!1\.0\.0\.1\b)(?!8\.8\.8\.8\b)(?!8\.8\.4\.4\b)(?!9\.9\.9\.9\b)(?!224\.0\.0\.)(?!239\.)(?!192\.168\.)(?!172\.(?:1[6-9]|2\d|3[01])\.)(?:[1-9]\d?|1\d\d|2[0-4]\d|25[0-5])(?:\.(?:\d{1,3})){3}(?![\w.-])(?<!\.0\.0\.0)"), "public IP address"),
     ("infra.ssh",      "CRITICAL", re.compile(r"\bssh\s+(-i\s+\S+\s+)?[a-z_][a-z0-9_-]*@[0-9A-Za-z.-]+"), "SSH connection string"),
-    ("infra.pem",      "WARNING",  re.compile(r"\S+\.pem\b"), "key file reference"),
+    ("infra.pem",      "WARNING",  re.compile(r"(?<!\S)\S+\.pem\b"), "key file reference"),
     ("infra.hostname", "WARNING",  HOSTNAME_RE, "internal host name"),
     ("path.home",      "CRITICAL", re.compile(r"(/Users/(?!Shared/)[A-Za-z][A-Za-z0-9_-]*/|/home/(?!user/)[a-z][a-z0-9_-]*/|C:\\\\Users\\\\[A-Za-z])"), "host-specific home path"),
     ("path.secrets",   "CRITICAL", re.compile(r"(^|\s)~?/?\.secrets/"), "secrets directory reference"),
@@ -183,9 +248,9 @@ DANGEROUS_FILES = [
     (re.compile(r"\.map$"), "source map"),
 ]
 
-def is_text(path):
+def is_text(path, include_logs=False):
     ext = os.path.splitext(path)[1].lower()
-    if ext not in TEXT_EXT:
+    if ext not in TEXT_EXT and not (include_logs and ext == ".log"):   # logs only when asked
         return False
     try:
         with open(path, "rb") as f:
@@ -205,7 +270,7 @@ def load_ignores(root):
     with open(ig) as f:
         return {l.strip() for l in f if l.strip() and not l.startswith("#")}
 
-def scan(root, allow):
+def scan(root, allow, include_logs=False):
     findings, files_scanned = [], 0
     ignores = set()   # absolute paths; every .sanitize-ignore under root contributes, relative to its own directory
     for dp, dns, fns in os.walk(root):
@@ -219,7 +284,7 @@ def scan(root, allow):
             for rx, label in DANGEROUS_FILES:
                 if rx.search(rel) and not fn.endswith(".example"):
                     findings.append(("file.dangerous", "CRITICAL", rel, 0, label, ""))
-            if not is_text(p):
+            if not is_text(p, include_logs):
                 continue
             files_scanned += 1
             try:
@@ -237,8 +302,9 @@ def scan(root, allow):
                                 m = next((x for x in rx.finditer(line) if check(x, line)), None)
                             if m is None:
                                 continue
+                            # every pattern is tried on every line, one finding each: a warning earlier
+                            # in the list must not hide a critical one later in it
                             findings.append((pid, sev, rel, n, label, truncate(m.group(0))))
-                            break
             except OSError:
                 pass
     return findings, files_scanned
@@ -251,6 +317,7 @@ def main():
     ap.add_argument("dirs", nargs="+", metavar="dir", help="one or more directories to scan")
     ap.add_argument("--report")
     ap.add_argument("--allow", action="append", default=[], help="regex; matching lines are ignored")
+    ap.add_argument("--include-logs", action="store_true", help="also scan .log files")
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args()
     for d in a.dirs:
@@ -259,7 +326,7 @@ def main():
     allow = [re.compile(x) for x in a.allow]
     findings, n = [], 0
     for d in a.dirs:
-        fs, scanned = scan(d, allow)
+        fs, scanned = scan(d, allow, a.include_logs)
         if len(a.dirs) > 1:   # keep paths distinguishable across directories
             base = os.path.basename(os.path.abspath(d))
             fs = [(pid, sev, os.path.join(base, rel), ln, label, snip) for pid, sev, rel, ln, label, snip in fs]

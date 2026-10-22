@@ -8,8 +8,9 @@ Checks agents (frontmatter, model, tools scalar, dispatchable description,
 minimum depth), skills (SKILL.md with name and description), hook rules
 (frontmatter and compilable pattern), hooks JSON, rule files (non-empty,
 paths frontmatter well-formed), personal or host paths anywhere, invisible or
-bidirectional unicode that can hide instructions, and unresolved template
-variables outside templates. Exit 0 clean, 1 warnings only, 2 errors.
+bidirectional unicode that can hide instructions, unresolved template
+variables outside templates, and plan labels (ACP and a dash before three digits)
+in any file or folder name or text. Exit 0 clean, 1 warnings only, 2 errors.
 
 Per-line exemption: a line carrying the comment
 
@@ -22,7 +23,7 @@ for it. Use it there and nowhere else; it silences one rule on one line.
 """
 import json, os, re, sys, pathlib
 if any(a in ("-h", "--help") for a in sys.argv[1:]):
-    print("usage: lint [--strict]\n  Validates agents, skills, hook rules, hooks JSON, rules, personal paths, invisible unicode, and cross-skill links. --strict makes warnings fail.\n  A line ending '# acp:lint-ignore personal-path' is exempt from that rule, for lines that must contain what the rule searches for."); sys.exit(0)
+    print("usage: lint [--strict]\n  Validates agents, skills, hook rules, hooks JSON, rules, personal paths, invisible unicode, cross-skill links, and plan labels. --strict makes warnings fail.\n  A line ending '# acp:lint-ignore personal-path' is exempt from that rule, for lines that must contain what the rule searches for."); sys.exit(0)
 
 ROOT = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("--") else pathlib.Path(__file__).resolve().parents[1])
 STRICT = "--strict" in sys.argv
@@ -34,6 +35,12 @@ BAD_UNICODE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2
 PERSONAL = re.compile(r"(/Users/(?!Shared/)[A-Za-z][A-Za-z0-9_-]*/|/home/(?!user/)[a-z][a-z0-9_-]*/|C:\\\\Users\\\\[A-Za-z])")
 # `# acp:lint-ignore <rule> [<rule>...]` — see the module docstring.
 LINT_IGNORE = re.compile(r"#\s*acp:lint-ignore\s+([A-Za-z0-9_\- ]+)")
+# A plan label names a step of the plan that built the pipeline, which no reader of the shipped tree can
+# look up: a comment says what the code guards, and a folder is named for what it checks. No exemption.
+PLAN_LABEL = re.compile(r"[Aa][Cc][Pp]-[0-9]{3}")
+# Only in the source repository (as bin/eval decides INSTALLED): an installed copy holds the project's own
+# path, which may hold anything.
+SOURCE = (ROOT / "pipeline.config.example.sh").exists()
 
 def yaml_ok(fm_text):
     """True when the frontmatter parses. Uses PyYAML when available; otherwise a strict
@@ -49,7 +56,9 @@ def yaml_ok(fm_text):
     for line in fm_text.split("\n"):
         if not line.strip(): continue
         if line.startswith((" ", "\t")):
-            if not prev_block and not re.match(r"^\s+- ", line) and not re.match(r"^\s+\S+: ", line): return False
+            # An indented line belongs to a key whose value was empty or a block marker. Under a plain value,
+            # `  key: value` is what YAML rejects ("mapping values are not allowed here").
+            if not prev_block and not re.match(r"^\s+- ", line): return False
             continue
         m = re.match(r"^([A-Za-z_][\w-]*):(\s*(.*))?$", line)
         if not m: return False
@@ -133,11 +142,24 @@ def ignored(p):
         if anc == ROOT: break
     return False
 
+def check_label(p):
+    """Every file and folder name, and every file whatever its suffix; a .sanitize-ignore list does not
+    exempt one, and a file that cannot be read is an error, not a pass."""
+    rel = p.relative_to(ROOT)
+    m = PLAN_LABEL.search(p.name)
+    if m: err(rel, f"plan label {m.group(0)!r} in a file or folder name; name it for what it checks")
+    if not p.is_file(): return
+    try: t = p.read_bytes().decode("utf-8", "replace")
+    except OSError as e: err(rel, f"could not be read for plan labels ({e.strerror})"); return
+    m = PLAN_LABEL.search(t)
+    if m: err(rel, f"plan label {m.group(0)!r} on line {t.count(chr(10), 0, m.start()) + 1}; say what the code guards instead")
+
 def check_text(p):
     rel = p.relative_to(ROOT)
     if ignored(p): return
     try: t = p.read_text()
     except UnicodeDecodeError: return
+    except OSError as e: err(rel, f"could not be read ({e.strerror})"); return
     if BAD_UNICODE.search(t): err(rel, "invisible or bidirectional unicode present")
     if "sanitize" not in p.name and "lint" not in p.name:
         for line in t.split("\n"):
@@ -165,7 +187,9 @@ for p in [ROOT / "core/config/settings.hooks.json"]:
 for p in sorted((ROOT / "core/rules").rglob("*.md")): check_rule(p)
 for sub in ("core", "harness", "bin", "docs"):
     for p in sorted((ROOT / sub).rglob("*")):
-        if "harness/evals/results" in str(p) or "__pycache__" in str(p): continue
+        rel = p.relative_to(ROOT)
+        if rel.parts[:3] == ("harness", "evals", "results") or "__pycache__" in rel.parts: continue
+        if SOURCE: check_label(p)
         if p.is_file() and p.suffix in (".md", ".sh", ".py", ".js", ".json", ".env", ".sql", "") and ".sanitize-ignore" not in p.name: check_text(p)
 
 for e in E: print(f"ERROR  {e}")

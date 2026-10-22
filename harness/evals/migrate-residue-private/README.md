@@ -1,0 +1,3 @@
+# migrate-residue-private
+
+Proves: acp migrate plan never files an item beside the work orders that holds private-looking material (profiles, a setup file, a restore note, a shared package, a zip) or a knowledge-base-shaped folder, at any depth, with the logs inside the project: each is its own entry with its own question (private folder, logs or delete, suggesting the private folder) that counts what was found and names knowledge bases, profiles, setup files and restore notes before zips; the private folder is asked for, also when an unknown item is the only reason; nothing of it is dropped; plain logs, and a folder whose only link leads to a knowledge base outside, stay residue.

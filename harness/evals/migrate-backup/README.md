@@ -1,0 +1,3 @@
+# migrate-backup
+
+Proves: acp migrate backup writes the whole project as one tar outside it, readable back to every byte, mode, link, hard link and empty folder, with a manifest and a record that match it; it refuses, leaving nothing that looks like a backup, when the target is the project or inside it however spelled (letter case, firmlink), when a repository keeps data outside the project (a linked worktree, borrowed objects), when something cannot be read or is a special file, or when the write fails, is killed or the project changes during it; a later run removes the old record first, and --check finds a changed project, archive, entry, manifest, sha256 file or record.

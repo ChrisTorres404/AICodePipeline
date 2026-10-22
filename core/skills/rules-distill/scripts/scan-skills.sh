@@ -56,7 +56,7 @@ scan_dir_to_json() {
   local dir="$1"
 
   local tmpdir
-  tmpdir=$(mktemp -d)
+  tmpbase="${TMPDIR:-/tmp}"; tmpdir=$(mktemp -d "${tmpbase%/}/scan-skills.XXXXXX")
   local _scan_tmpdir="$tmpdir"
   _scan_cleanup() { rm -rf "$_scan_tmpdir"; }
   trap _scan_cleanup RETURN

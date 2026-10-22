@@ -58,7 +58,7 @@ if [[ ! "$evaluated_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2
   exit 1
 fi
 
-tmpdir=$(mktemp -d)
+tmpbase="${TMPDIR:-/tmp}"; tmpdir=$(mktemp -d "${tmpbase%/}/stocktake-diff.XXXXXX")
 # Use a function to avoid embedding $tmpdir in a quoted string (prevents injection
 # if TMPDIR were crafted to contain shell metacharacters).
 _cleanup() { rm -rf "$tmpdir"; }

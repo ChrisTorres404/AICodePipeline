@@ -549,11 +549,11 @@ system_status() {
   echo "${BOLD}Database${NC}"
   if ! db_configured; then
     echo "  ${DIM}not configured — set DB_NAME to enable the SQL helpers${NC}"
-  elif psql -h "${DB_HOST:-localhost}" -p "${DB_PORT:-5432}" -U "${DB_USER:-$USER}" \
+  elif psql -h "${DB_HOST:-localhost}" -p "${DB_PORT:-5432}" -U "${DB_USER:-${USER:-$(id -un 2>/dev/null || true)}}" \
             -d "$DB_NAME" -t -A -c "SELECT 1;" > /dev/null 2>&1; then
     echo "  ${GREEN}connected${NC}  ${DB_USER:-}@${DB_HOST:-}:${DB_PORT:-}/${DB_NAME}"
     local idle
-    idle="$(psql -h "${DB_HOST:-localhost}" -p "${DB_PORT:-5432}" -U "${DB_USER:-$USER}" \
+    idle="$(psql -h "${DB_HOST:-localhost}" -p "${DB_PORT:-5432}" -U "${DB_USER:-${USER:-$(id -un 2>/dev/null || true)}}" \
       -d "$DB_NAME" -t -A -c \
       "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = '$DB_NAME' AND state = 'idle';" \
       2>/dev/null | tr -d '[:space:]')"
@@ -723,7 +723,7 @@ load_check() {
   echo ""
 
   local work
-  work="$(mktemp -d "${TMPDIR:-/tmp}/harness-load.XXXXXX")" || return 1
+  tmpbase="${TMPDIR:-/tmp}"; work="$(mktemp -d "${tmpbase%/}/harness-load.XXXXXX")" || return 1
 
   # One argument list, built once: an Origin header only when one is
   # configured, a body only when the method takes one.
@@ -827,7 +827,7 @@ cleanup_test_data() {
     return 0
   fi
 
-  if psql -h "${DB_HOST:-localhost}" -p "${DB_PORT:-5432}" -U "${DB_USER:-$USER}" \
+  if psql -h "${DB_HOST:-localhost}" -p "${DB_PORT:-5432}" -U "${DB_USER:-${USER:-$(id -un 2>/dev/null || true)}}" \
           -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "$TEST_CLEANUP_SQL"; then
     echo "${GREEN}Cleanup applied.${NC}"
   else

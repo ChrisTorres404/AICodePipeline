@@ -43,7 +43,7 @@ LIST_FILE=""
 
 # --- the file list ---------------------------------------------------------
 collect() {
-  LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/acp-portability.XXXXXX")"
+  tmpbase="${TMPDIR:-/tmp}"; LIST_FILE="$(mktemp "${tmpbase%/}/acp-portability.XXXXXX")"
   find "$ROOT" \
       \( -name .git -o -name node_modules -o -name dist -o -name __pycache__ \
          -o -name playbooks -o -name Examples_for_claude -o -name results \) -prune \
@@ -70,7 +70,9 @@ collect() {
 rule() {
   local id="$1" re="$2" why="$3" allow="${4:-}" hits
   if [ "$LIST_ONLY" -eq 1 ]; then printf '  %-22s %s\n' "$id" "$why"; return 0; fi
-  hits="$(xargs grep -nE -- "$re" < "$LIST_FILE" 2>/dev/null || true)"
+  # NUL-separated, so a path holding a space or a quote reaches grep whole; /dev/null makes grep name
+  # the file even when xargs hands it one alone.
+  hits="$(tr '\n' '\0' < "$LIST_FILE" | xargs -0 grep -nE -- "$re" /dev/null 2>/dev/null || true)"
   hits="$(printf '%s\n' "$hits" | grep -vE "portability-ok:[[:space:]]*$id" || true)"
   [ -n "$allow" ] && hits="$(printf '%s\n' "$hits" | grep -vE -- "$allow" || true)"
   case "$id" in
@@ -80,7 +82,7 @@ rule() {
   [ -z "$hits" ] && return 0
   FOUND=1
   printf '\n  %s — %s\n' "$id" "$why"
-  printf '%s\n' "$hits" | sed "s|^$ROOT/|    |"
+  local h; printf '%s\n' "$hits" | while IFS= read -r h; do printf '    %s\n' "${h#"$ROOT"/}"; done   # the root as data
 }
 
 rules() {
@@ -114,9 +116,12 @@ rules() {
        "realpath(1) is not installed on macOS; use cd+pwd or python3"
   rule "mktemp-t"       'mktemp[[:space:]]+(-[a-zA-Z]*[[:space:]]+)*-t([[:space:]]|$)' \
        "mktemp -t means a prefix on BSD and a template on GNU; pass an explicit XXXXXX template"
+  # a mktemp -d with no template: macOS ignores TMPDIR then and uses its own folder
+  rule "mktemp-bare"    'mktemp([[:space:]]+-[a-zA-Z]+)*[[:space:]]+-[a-zA-Z]*d[a-zA-Z]*([[:space:]]+-[a-zA-Z]+)*[[:space:]]*($|[);|&`<>]|[0-9][<>])' \
+       "mktemp -d with no template ignores TMPDIR on macOS; pass one, as mktemp -d \"\${TMPDIR:-/tmp}/name.XXXXXX\""
   rule "xargs-r"        'xargs[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*r([[:space:]]|$)|--no-run-if-empty' \
        "xargs -r is GNU only; guard the pipeline instead"
-  rule "grep-perl"      'grep[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*P([[:space:]]|$)|--perl-regexp' \
+  rule "grep-perl"      '(^|[^[:alnum:]_.-])(z|bz|xz|lz|zstd)?grep[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-[a-zA-Z]*P([[:space:]]|$)|--perl-regexp' \
        "grep -P is GNU only; use -E with POSIX classes"
   rule "find-printf"    'find[[:space:]].*-printf' \
        "find -printf is GNU only; use -exec or a read loop"

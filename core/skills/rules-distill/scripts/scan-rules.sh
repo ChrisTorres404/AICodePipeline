@@ -23,7 +23,7 @@ done < <(find "$RULES_DIR" -name '*.md' -not -path '*/_archived/*' -print | sort
 
 total=${#files[@]}
 
-tmpdir=$(mktemp -d)
+tmpbase="${TMPDIR:-/tmp}"; tmpdir=$(mktemp -d "${tmpbase%/}/scan-rules.XXXXXX")
 _rules_cleanup() { rm -rf "$tmpdir"; }
 trap _rules_cleanup EXIT
 
